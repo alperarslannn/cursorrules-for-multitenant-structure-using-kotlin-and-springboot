@@ -1,0 +1,3151 @@
+ # Triarii Growth Funnel Backend — Cursor Rules (Kotlin)
+
+You are an expert Kotlin + Spring Boot 3 + Spring Security engineer specializing in multi-tenant backend architectures.
+Respond with production-quality code, following Kotlin idioms and Spring best practices. 
+The project is a Spring Boot application written fully in Kotlin.
+
+**Purpose:**
+This file is a Cursor rules / project-level guidance document for a Kotlin-based Spring Boot (Maven) multi-tenant backend. It adapts the original Java rules to Kotlin idioms while keeping the same architecture, multi-schema tenancy, security, and deployment choices (Postgres, Liquibase, GitHub Actions, Railway). Use this as the authoritative style & behavior guide for code generation and review.
+
+---
+
+## High-level decisions (kept from Java project)
+
+* Multi-schema tenancy (Postgres) — each tenant has its own schema. First tenant: `someTenant`.
+* Path-based tenant resolution using path segment: `/api/admin/{tenantCode}/...`, `/api/funnel/{tenantCode}/...`, `/api/user/{tenantCode}/...`.
+* Exceptions: OAuth2 (`/login/google`, `/oauth2/**`), actuator (`/actuator/health`, `/actuator/info`), dev endpoints (`/api/dev/**` for `dev/test` profiles only), Swagger (`/swagger-ui/**`, `/v3/api-docs/**`).
+* Security: Google OAuth2 login + JWT for APIs, roles: `SUPER_ADMIN`, `TENANT_ADMIN`, `FUNNEL_ADMIN`, `USER`.
+* Use Liquibase for migrations with explicit schema names.
+* Maven for build; Postgres as DB; GitHub Actions + Railway for CI/CD.
+* Swagger/OpenAPI via springdoc-openapi.
+* Keep deployment style and environment keys as in Java project (profiles: `dev`, `ci`, `prod`).
+
+---
+
+## What Cursor must do (behavioral contract)
+
+* Always generate Kotlin code (not Java) unless the user explicitly requests Java output.
+* Prefer idiomatic Kotlin constructs: `data class`, `sealed class`, `object` singletons for utilities, extension functions, top-level functions, `val` over `var`, nullable types with safe handling, `apply/also/run/let` where appropriate.
+* Use Kotlin + Spring Boot best practices: `kotlin-spring` and `kotlin-jpa` (all-open / no-arg) plugins when generating entities and configuration.
+* For JPA entities: create open classes (or add `all-open` plugin) and provide default values to satisfy JPA. Avoid `!!` in generated code.
+* Use Spring Web MVC (servlet) stack with traditional blocking operations for now. Coroutines can be added later when needed (documented below).
+* Generate complete files including package statements and imports.
+* Include short non-verbose explanation only where necessary. Do not write long Kotlin tutorials.
+
+---
+
+## CRITICAL: Updating This .cursorrules File
+
+**NEVER update this file without explicit user approval!**
+
+### When Updates May Be Needed
+
+This `.cursorrules` file should be updated when:
+- **New architectural decisions** are made (e.g., new endpoint types, new authentication methods, new patterns)
+- **Business logic changes** that affect coding patterns (e.g., new payment types, new role behaviors)
+- **New conventions** are established (e.g., naming patterns, code organization)
+- **Technology choices** change (e.g., switching libraries, adding new frameworks)
+- **Security policies** are updated (e.g., new validation rules, new access patterns)
+- **Development workflow** changes (e.g., new testing requirements, new deployment processes)
+
+### Update Process (MANDATORY)
+
+1. **ALWAYS ask the user first** before proposing any changes to `.cursorrules`
+2. **Explain why** the update is needed (what changed, what needs to be documented)
+3. **Show the proposed changes** (what section, what will be added/modified)
+4. **Wait for explicit approval** before making any edits
+5. **Never assume** - if unsure whether an update is needed, ask the user
+
+### Handling Conflicts Between User Requests and .cursorrules
+
+**When a user request conflicts with existing `.cursorrules`:**
+
+1. **Point out the conflict** clearly:
+   ```
+   "I notice your request to [do X] conflicts with the current .cursorrules which states [rule Y]. 
+   This could indicate either:
+   - A change in approach/architecture that should be documented
+   - An exception to the rule for this specific case
+   - The rule needs to be updated"
+   ```
+
+2. **Ask the user to clarify their intent:**
+   ```
+   "Would you like me to:
+   A) Make the change AND update .cursorrules to reflect this new approach?
+   B) Make the change as an exception (rules stay the same)?
+   C) Stick to the current .cursorrules (decline the change)?
+   "
+   ```
+
+3. **Wait for user decision** before proceeding
+
+4. **If user chooses option A**: Follow the update process above (ask, explain, show changes, wait for approval)
+
+**Example Conflict Scenarios:**
+- User asks to use Lombok → Conflicts with "Do NOT use Lombok in Kotlin modules"
+- User asks to hardcode a path → Conflicts with "Do NOT hardcode API paths"
+- User asks for Java code → Conflicts with "Do NOT generate Java code by default"
+- User asks to modify a migration after CI → Conflicts with migration modification policy
+
+**Remember:** The user's intent takes precedence, but always clarify whether the rules should be updated to reflect the change.
+
+### Example Interaction
+
+**❌ WRONG:**
+```
+[AI directly edits .cursorrules without asking]
+```
+
+**✅ CORRECT:**
+```
+I notice we've added a new payment gateway (Stripe) with different webhook handling. 
+This should be documented in the .cursorrules file under the "Payment Integration" 
+section. Should I update the rules file to include Stripe webhook patterns?
+
+[Wait for user approval before editing]
+```
+
+**Remember:** This file is the source of truth for the project. Changes must be intentional and approved.
+
+---
+
+## Package Structure (CRITICAL - Follow This!)
+
+The codebase uses a three-tier package structure for multi-tenancy:
+
+### 1. `com.triariigrowth.funnel.platform/`
+**Purpose:** Platform management - operates on `public` schema
+**Contains:**
+- `model/entity/` - Tenant.kt, TenantAdmin.kt, FunnelAdmin.kt (with `@Table(schema="public")`)
+- `repository/` - TenantRepository, TenantAdminRepository, FunnelAdminRepository
+
+**Example:**
+```kotlin
+@Entity
+@Table(name = "tenants", schema = "public")  // Explicit public schema
+open class Tenant(
+    // Inherits: id (UUID), insertTime, updateTime, insertUser, updateUser from BaseEntity
+    @Column(name = "tenant_id", nullable = false, unique = true)
+    open var tenantId: String = "",
+    // ...
+) : BaseEntity()
+```
+
+### 2. `com.triariigrowth.funnel.tenant/someTenant/`
+**Purpose:** someTenant tenant - operates on `someTenant` schema (dynamically resolved)
+**Contains:**
+- `model/entity/` - All tenant entities (NO schema in @Table)
+- `model/dto/request/` - All request DTOs
+- `model/dto/response/` - All response DTOs (except ApiResponse)
+- `repository/` - All tenant-specific repositories
+- `service/` - All business logic services
+- `specification/` - JPA Specifications for search (extends BaseSpecification)
+- `controller/admin/` - Admin controllers requiring authentication
+- `controller/funnel/` - Funnel controllers requiring authentication
+- `controller/user/` - User controllers requiring authentication
+
+**Example:**
+```kotlin
+@Entity
+@Table(name = "exams")  // NO schema - uses current tenant from TenantContext
+open class Exam(
+    // Inherits: id (UUID), insertTime, updateTime, insertUser, updateUser from BaseEntity
+    @Column(name = "exam_name", nullable = false)
+    open var examName: String = "",
+    // ...
+) : BaseEntity()
+```
+
+### 3. `com.triariigrowth.funnel.common/`
+**Purpose:** Shared infrastructure used across platform and tenants
+**Contains:**
+- `config/` - HibernateConfig, SecurityConfig, WebConfig, etc.
+- `security/` - JwtTokenProvider, JwtAuthenticationFilter, OAuth2 handlers
+- `multitenancy/` - TenantContext, PathTenantExtractor, TenantInterceptor, etc.
+- `constant/` - BasePaths (centralized API path constants)
+- `exception/` - GlobalExceptionHandler, custom exceptions
+- `model/dto/` - ApiResponse (shared DTO)
+- `model/enums/` - UserRole, etc.
+- `util/` - PaginationAndSearchHelper (utility for controllers)
+
+**When creating new tenants:** Create `tenant/newtenantname/` following the same structure as `tenant/someTenant/`
+
+**Note:** Tenant-specific configuration classes belong in `tenant/{tenantname}/config/`, NOT in `common/config/`
+
+---
+
+## Centralized Path Constants (CRITICAL - No Hardcoded Paths!)
+
+All API paths are centralized in constant classes to ensure consistency and maintainability.
+
+### 1. `BasePaths.kt` - `common/constant/`
+
+**Purpose:** Single source of truth for ALL controller base paths.
+
+**Structure:**
+```kotlin
+object BasePaths {
+    // Root API paths
+    const val API_ADMIN = "/api/admin"
+    const val API_FUNNEL = "/api/funnel"
+    const val API_USER = "/api/user"
+    
+    // Tenant path segment
+    const val TENANT_CODE = "/{tenantCode}"
+
+    // Admin API paths (build on root + tenant)
+    const val ADMIN_RESOURCE = "$API_ADMIN$TENANT_CODE/resource"
+    
+    // Funnel API paths (build on root + tenant)
+    const val FUNNEL_RESOURCE = "$API_FUNNEL$TENANT_CODE/resource"
+    
+    // User API paths (build on root + tenant)
+    const val USER_RESOURCE = "$API_USER$TENANT_CODE/resource"
+}
+```
+
+**Benefits:**
+- Change API version in one place → all endpoints update
+- Compile-time safety → refactoring tools work perfectly
+- No path duplication anywhere in codebase
+
+**Usage in Controllers:**
+```kotlin
+@RestController
+@RequestMapping(BasePaths.FUNNEL_RESOURCE)  // ✅ Use constant (includes {tenantCode})
+class FunnelResourceController(
+    private val service: ResourceService
+) {
+    
+    @PostMapping("/initiate")
+    @Operation(summary = "Initiate resource")
+    fun initiate(
+        @PathVariable tenantCode: String,  // ✅ Extract tenant from path
+        @Valid @RequestBody request: ResourceRequest
+    ): ResponseEntity<ApiResponse<ResourceResponse>> {
+        val response = service.initiate(request)
+        return ResponseEntity.ok(ApiResponse.success(response))
+    }
+}
+
+// ❌ NEVER hardcode paths:
+@RequestMapping("/api/funnel/resource")  // BAD! Missing {tenantCode}
+```
+
+### 2. Rules for Path Constants
+
+- ✅ **ALWAYS** use `BasePaths` constants in `@RequestMapping`
+- ✅ **ALWAYS** use `BasePaths.API_ADMIN` / `BasePaths.API_FUNNEL` / `BasePaths.API_USER` for path checks
+- ✅ **ALWAYS** use `BasePaths` constants in utility classes (PathTenantExtractor, filters, interceptors)
+  - Example: `BasePaths.API_FUNNEL + "/"` instead of `"/api/funnel/"`
+  - Ensures consistency and single source of truth
+- ❌ **NEVER** hardcode API paths anywhere (controllers, filters, interceptors, tests, utility classes)
+- ❌ **NEVER** duplicate path strings
+- ✅ Build paths hierarchically (root → base → specific)
+
+### 3. Checklist: Adding New API Path Prefixes (CRITICAL)
+
+**When adding a new API path prefix (e.g., `/api/partner`, etc.), you MUST update ALL of the following:**
+
+1. ✅ **BasePaths.kt** (`common/constant/`)
+   - Add new root path constant: `const val API_PARTNER = "/api/partner";`
+   - Add tenant-based paths: `const val PARTNER_RESOURCE = "$API_PARTNER$TENANT_CODE/resource";`
+
+2. ✅ **PathTenantExtractor.kt** (`common/multitenancy/`)
+   - Add prefix constant using BasePaths: `private const val API_PARTNER_PREFIX = "${BasePaths.API_PARTNER}/"`
+   - Add check in `extractTenantFromPath()` function
+   - Update `isTenantBasedPath()` to include new prefix
+
+3. ✅ **SecurityConfig.kt** (`common/config/`)
+   - Add authorization rule: `.requestMatchers("${BasePaths.API_PARTNER}/**").hasAuthority(UserRole.PARTNER_AUTHORITY)`
+   - Update CSRF ignoring if needed
+
+4. ✅ **TenantInterceptor.kt** (`common/multitenancy/`)
+   - Add path check in `preHandle()` method if tenant validation is needed
+   - Update WebConfig to register interceptor for new path pattern
+
+5. ✅ **WebConfig.kt** (`common/config/`)
+   - Add new path pattern to interceptor registration: `.addPathPatterns("${BasePaths.API_ADMIN}/**", "${BasePaths.API_FUNNEL}/**", "${BasePaths.API_USER}/**", "${BasePaths.API_PARTNER}/**")`
+
+6. ✅ **JwtAuthenticationFilter.kt** (`common/security/`)
+   - Add role handling if new path requires specific role validation
+   - Ensure role is properly handled in authentication logic
+
+**Why this matters:**
+- Ensures tenant extraction works correctly
+- Ensures security rules are applied
+- Ensures tenant context is set properly
+- Prevents hardcoded paths throughout the codebase
+- Maintains consistency and single source of truth
+
+---
+
+## Multi-tenancy rules (Kotlin specifics)
+
+### Tenant extraction
+
+* Implement `PathTenantExtractor` as a Kotlin `object` with pure functions. Use `BasePaths` constants to detect tenant-based prefixes.
+* Accept tenant codes of variable length (3–50+). Reject `public` (case-insensitive).
+
+### Tenant context
+
+* Implement `TenantContext` as Kotlin `object` exposing a `ThreadLocal<String?>` and helper utilities:
+
+```kotlin
+object TenantContext {
+    private val current = ThreadLocal<String?>()
+
+    fun setCurrentTenant(tenant: String) = current.set(tenant)
+    fun getCurrentTenant(): String? = current.get()
+    fun clear() = current.remove()
+}
+```
+
+**CRITICAL**: During validation in `TenantInterceptor`, **always set** `TenantContext.setCurrentTenant(validatedTenant)` and avoid a flow that leaves it null — set it even in `finally`/guard to avoid the resolver defaulting to `public` mid-request.
+
+### Coroutines note (Future Enhancement)
+
+* **Current Approach**: Use traditional blocking Spring MVC for now (simpler, less risk for new Kotlin developers).
+* **Future Enhancement**: When ready to use coroutines, Cursor should add a bridge to copy `TenantContext` into `CoroutineContext` when launching coroutines. Provide helper extension functions:
+
+```kotlin
+fun CoroutineScope.launchWithTenant(block: suspend CoroutineScope.() -> Unit) =
+    launch(context = coroutineContext + TenantCoroutineContext(TenantContext.getCurrentTenant()), block = block)
+```
+
+* Document that when coroutines cross thread boundaries, developer must propagate tenant context explicitly.
+
+### CurrentTenantIdentifierResolver & MultiTenantConnectionProvider
+
+* Keep these classes but generate Kotlin `@Component` implementations with the same behavior as Java versions. They should read `TenantContext.getCurrentTenant()` and default to `public` when null.
+
+### TenantInterceptor
+
+* Register `TenantInterceptor` for path patterns: `/api/admin/**`, `/api/funnel/**`, `/api/user/**`.
+* It must: extract path tenant, reject `public`, validate tenant exists & active (read from `public.tenants` via `TenantRepository`), set `TenantContext` to validated tenant.
+* For non-tenant endpoints the interceptor is NOT registered.
+
+### CRITICAL: Tenant Awareness
+
+1. **Tenant Context Setting:**
+   - **All endpoints** (`/api/admin/{tenantCode}/*`, `/api/funnel/{tenantCode}/*`, `/api/user/{tenantCode}/*`): 
+     - `TenantInterceptor` extracts tenant from URL path using `PathTenantExtractor`
+     - **Security**: Rejects "public" as tenant code (reserved PostgreSQL schema name, case-insensitive)
+     - Validates tenant exists and is active (for funnel and user endpoints)
+     - Sets `TenantContext.setCurrentTenant(tenantCode)`
+     - **CRITICAL**: Tenant context is NEVER cleared to null during validation
+       - `validateAndSetTenant()` always sets tenant context to validated tenant code in finally block
+       - Prevents `CurrentTenantIdentifierResolver` from seeing null and defaulting to "public"
+       - Ensures resolver and connection provider use the same tenant schema
+       - Eliminates race conditions that could cause queries to hit multiple schemas
+   - **Admin endpoints** (`/api/admin/{tenantCode}/*`):
+     - **TENANT_ADMIN**: `JwtAuthenticationFilter` validates path tenant matches JWT tenant
+     - **SUPER_ADMIN**: `JwtAuthenticationFilter` validates role, allows access to any tenant
+   - **Funnel endpoints** (`/api/funnel/{tenantCode}/*`):
+     - **FUNNEL_ADMIN**: `JwtAuthenticationFilter` validates path tenant matches JWT tenant
+     - **SUPER_ADMIN**: `JwtAuthenticationFilter` validates role, allows access to any tenant
+   - **User endpoints** (`/api/user/{tenantCode}/*`):
+     - **USER**: `JwtAuthenticationFilter` validates path tenant matches JWT tenant
+     - Tenant validated by `TenantInterceptor` (must exist and be active)
+2. **Services:** Operations automatically work with current tenant schema
+3. **Repositories:** Hibernate uses tenant schema from TenantContext via MultiTenantConnectionProvider
+4. **Testing:** 
+   - Always set up tenant in `public.tenants` table in `@BeforeEach`
+   - Include tenant code in all test URLs: `/api/funnel/someTenant/resource` (not `/api/funnel/resource`)
+   - Call `TenantContext.setCurrentTenant("someTenant")` before repository operations
+   - Use JDBC `TRUNCATE TABLE` instead of `repository.deleteAll()` in setUp to avoid schema issues
+   - Call `TenantContext.clear()` in `@AfterEach`
+
+### What NOT to Do
+- ❌ Don't manually switch tenant context in services
+- ❌ Don't bypass TenantContext
+- ❌ Don't create cross-tenant queries
+- ❌ Don't store tenant-specific data in public schema
+- ❌ Don't add `hibernate.default_schema` to application.yml (breaks multi-tenancy!)
+- ❌ Don't add `schema` attribute to tenant entity @Table annotations
+- ❌ Don't use `repository.deleteAll()` in integration test setUp (causes schema resolution issues)
+- ❌ **NEVER use "public" as tenant code** - it's a reserved PostgreSQL schema name (case-insensitive)
+- ❌ **NEVER clear tenant context to null** during validation - always set to validated tenant code
+
+---
+
+## Endpoint types & security rules
+
+Three endpoint groups: `admin`, `funnel`, `user`.
+
+### Access matrix
+
+* `SUPER_ADMIN` — can access `admin` + `funnel` for any tenant, can access Swagger and platform admin endpoints.
+* `TENANT_ADMIN` — can access `admin` endpoints only for their tenant (JWT contains tenantId). **Cannot access funnel endpoints unless they also have FUNNEL_ADMIN role.**
+* `FUNNEL_ADMIN` — can access `funnel` endpoints only for their tenant (JWT contains tenantId). **Cannot access admin endpoints unless they also have TENANT_ADMIN role.**
+* `USER` — can access `user` endpoints only (JWT contains tenantId)
+
+**Combined Roles:**
+* If the same email exists in both `tenant_admins` and `funnel_admins` tables **for the same tenantId** (determined by login URL parameter), the user gets **BOTH** roles (`TENANT_ADMIN` and `FUNNEL_ADMIN`) for that tenant.
+* The JWT token will contain both authorities, allowing access to both `/api/admin/**` and `/api/funnel/**` endpoints for that tenant with a single login.
+* **Multi-Tenant Users**: A user can be TENANT_ADMIN for "someTenant" and FUNNEL_ADMIN for "othertenant". Each login is scoped to one tenant via the `tenant` query parameter in the login URL. The JWT contains the tenantId from the login URL, not from the tables.
+
+### JwtAuthenticationFilter (Kotlin)
+
+* Implement as a Spring `OncePerRequestFilter` in Kotlin. Behavior:
+
+  * Extract JWT from `Authorization: Bearer ...`.
+  * Validate token, extract `email`, `tenantId`, `roles` (array/list), `name`.
+  * **Multiple Roles Support**: JWT can contain multiple roles if user exists in both `tenant_admins` and `funnel_admins` tables.
+  * Build an `OAuth2User`-like principal (or a custom `UserPrincipal`) that holds `email`, `name`, `tenantId` and `authorities` (all roles).
+  * For `TENANT_ADMIN`, `FUNNEL_ADMIN` and `USER`: validate JWT tenant matches path tenant; otherwise throw `TenantNotFoundException`.
+  * `SUPER_ADMIN` bypasses tenant match.
+  * Support session fallback for OAuth2 login flows: validate `SESSION_TENANT` in session for browser-based access (Swagger UI), but JWT is the primary auth for APIs.
+
+**Principal Type:**
+- **ALWAYS** creates `OAuth2User` object (not String) as principal
+- This ensures `@AuthenticationPrincipal OAuth2User` works in controllers
+- OAuth2User contains: email, name (if available from JWT or session), and authorities (all roles as Collection<GrantedAuthority>)
+
+**Tenant Validation Rules:**
+- **TENANT_ADMIN**: JWT tenant must match path tenant (JWT and session) - only for `/api/admin/**` paths
+- **FUNNEL_ADMIN**: JWT tenant must match path tenant (JWT and session) - only for `/api/funnel/**` paths
+- **Combined Roles (TENANT_ADMIN + FUNNEL_ADMIN)**: User can access both `/api/admin/**` and `/api/funnel/**` endpoints (tenant validation applies to each endpoint type)
+- **USER**: JWT tenant must match path tenant (JWT and session) - only for `/api/user/**` paths
+- **SUPER_ADMIN**: No tenant validation (can access any tenant)
+- **Anonymous**: No tenant validation (not applicable - no public endpoints)
+
+### OAuth2 flow
+
+* `/login/google?redirect_url=...&tenant=...` stores redirect URL and tenant (if present) in session.
+* **CRITICAL**: The `tenant` query parameter determines which tenant context the user logs in as. This tenantId will be used in the JWT token.
+* `OAuth2LoginSuccessHandler` extracts `name` from attributes and maps roles + tenant according to rules:
+
+  * **Role Resolution Logic:**
+    1. Get `tenantId` from login URL parameter (`tenant` query param) - this is the tenant context for this login session
+    2. Check if email exists in `tenant_admins` table **WHERE tenant_id = login_tenantId** → if yes, add `TENANT_ADMIN` role
+    3. Check if email exists in `funnel_admins` table **WHERE tenant_id = login_tenantId** → if yes, add `FUNNEL_ADMIN` role
+    4. If email exists in both tables for the same tenantId → user gets **BOTH** roles for that tenant
+    5. If email exists in neither table for the login tenantId → check if it's `SUPER_ADMIN` (from config), otherwise assign `USER` role
+    6. **Important**: A user can be TENANT_ADMIN for multiple different tenants (e.g., "someTenant" and "othertenant"). Each login is scoped to one tenant via the `tenant` query parameter.
+  * `USER`: tenant comes from `OAUTH2_TENANT` in session (from login URL parameter).
+* Always generate JWT via `JwtTokenProvider.generateToken(email, tenantId, roles, name)` where:
+  - `tenantId` = the tenant from login URL parameter (not from tables)
+  - `roles` = list/array of all roles the user has for THAT specific tenant
+* Redirect to frontend only after validating origin is allowed (compare against `app.cors.allowed-origins`). On invalid origin throw exception.
+
+**Session Storage:**
+- `OAUTH2_REDIRECT_URL`: Frontend URL (temporary, removed after redirect)
+- `OAUTH2_TENANT`: Tenant for USER role (temporary, moved to `SESSION_TENANT`)
+- `SESSION_TENANT`: Tenant for session-based validation (persists for session lifetime)
+
+---
+
+## API Controller Development Rules
+
+### Controller Structure
+1. **ALWAYS use these annotations on controllers:**
+   - `@RestController`
+   - `@RequestMapping(BasePaths.ADMIN_RESOURCE)` or `@RequestMapping(BasePaths.FUNNEL_RESOURCE)` or `@RequestMapping(BasePaths.USER_RESOURCE)` (includes {tenantCode})
+   - Primary constructor injection (Kotlin style): `class XController(private val service: XService)`
+   - `@Tag(name = "Admin - Resource", description = "...")` (for admin controllers) or `@Tag(name = "Funnel - Resource", description = "...")` (for funnel controllers) or `@Tag(name = "User - Resource", description = "...")` (for user controllers) - **REQUIRED FOR ALL CONTROLLERS**
+   - `@SecurityRequirement(name = "Bearer Authentication")` (for ALL authenticated endpoints - admin, funnel, and user)
+
+2. **Admin vs Funnel vs User Controllers:**
+   - Admin endpoints: `/api/admin/{tenantCode}/*` - require JWT authentication (SUPER_ADMIN, TENANT_ADMIN, or user with both TENANT_ADMIN + FUNNEL_ADMIN)
+   - Funnel endpoints: `/api/funnel/{tenantCode}/*` - require JWT authentication (SUPER_ADMIN, FUNNEL_ADMIN, or user with both TENANT_ADMIN + FUNNEL_ADMIN)
+   - User endpoints: `/api/user/{tenantCode}/*` - require JWT authentication (USER)
+   - **ALL controller methods MUST accept `@PathVariable tenantCode: String` as first parameter**
+   - **ALL authenticated controllers MUST have `@SecurityRequirement(name = "Bearer Authentication")`** - This is a Swagger/OpenAPI documentation annotation that tells Swagger UI the endpoint requires authentication (adds "Authorize" button). It does NOT enforce security - that's done by `@PreAuthorize` and Spring Security configuration.
+   - **ALL controllers MUST have `@Tag` annotation on the controller class**
+
+### Endpoint Documentation (Swagger/OpenAPI)
+**CRITICAL: EVERY endpoint MUST have proper Swagger documentation!**
+
+1. **Required annotations on EVERY endpoint method:**
+   ```kotlin
+   @Operation(summary = "Short description of what endpoint does")
+   @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'TENANT_ADMIN')") // for admin endpoints
+   @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')") // for funnel endpoints
+   ```
+
+2. **Swagger documentation checklist (MANDATORY):**
+   - ✅ `@Tag` on controller class with descriptive name - **REQUIRED FOR ALL CONTROLLERS**
+   - ✅ `@Operation(summary = "...")` on every method - **REQUIRED FOR ALL ENDPOINTS**
+   - ✅ `@SecurityRequirement(name = "Bearer Authentication")` on ALL authenticated controllers (admin, funnel, user)
+     - **Purpose**: Swagger/OpenAPI documentation annotation (NOT security enforcement)
+     - **What it does**: Tells Swagger UI that the endpoint requires authentication, adds "Authorize" button
+     - **Security enforcement**: Done by `@PreAuthorize` annotations and Spring Security configuration
+   - ✅ Use proper HTTP status codes (200 OK, 201 CREATED, 404 NOT_FOUND)
+   
+3. **When creating a new controller, ALWAYS include:**
+   ```kotlin
+   @RestController
+   @RequestMapping(BasePaths.FUNNEL_RESOURCE) // or BasePaths.ADMIN_RESOURCE or BasePaths.USER_RESOURCE (includes {tenantCode})
+   @Tag(name = "Funnel - Resource", description = "Resource management endpoints") // MANDATORY
+   @SecurityRequirement(name = "Bearer Authentication")
+   class FunnelResourceController(
+       private val service: ResourceService
+   ) {
+       
+       @GetMapping
+       @Operation(summary = "Get all resources") // MANDATORY
+       fun getAll(
+           @PathVariable tenantCode: String  // ✅ ALWAYS first parameter
+       ): ResponseEntity<ApiResponse<List<ResourceResponse>>> {
+           // ...
+       }
+   }
+   ```
+
+### Request/Response Patterns
+1. **ALWAYS wrap responses in `ApiResponse<T>`:**
+   ```kotlin
+   return ResponseEntity.ok(ApiResponse.success(data))
+   return ResponseEntity.status(HttpStatus.CREATED)
+       .body(ApiResponse.success(data, "Resource created successfully"))
+   ```
+
+2. **ALWAYS validate request bodies with `@Valid`:**
+   ```kotlin
+   fun create(
+       @PathVariable tenantCode: String,
+       @Valid @RequestBody request: Request
+   ): ResponseEntity<ApiResponse<T>>
+   ```
+
+3. **Standard CRUD endpoints pattern:**
+   - `GET /resource` - List all with pagination, sorting, and search
+   - `GET /resource/{resourceId}` - Get by ID
+   - `POST /resource` - Create (return 201 CREATED)
+   - `PUT /resource/{resourceId}` - Update (return 200 OK)
+   - `DELETE /resource/{resourceId}` - Delete (return 200 OK with success message)
+   
+   **Path Variable Naming:**
+   - **ALWAYS** use descriptive path variable names: `{resourceId}`, `{examId}`, `{paymentId}`, etc.
+   - **NEVER** use generic `{id}` - use the resource name + "Id" (e.g., `{resourceId}`, `{examId}`)
+   - Example: `@GetMapping("/{resourceId}")` with `@PathVariable resourceId: UUID`
+
+4. **Pagination, Sorting, and Search (REQUIRED for all list endpoints):**
+   ```kotlin
+   @GetMapping
+   @Operation(summary = "Get all resources with pagination and search")
+   fun getAll(
+       @PathVariable tenantCode: String,
+       @RequestParam(defaultValue = "0") page: Int,
+       @RequestParam(defaultValue = "20") size: Int,
+       @RequestParam(defaultValue = "insertTime,desc") sort: String,  // Uses insertTime from BaseEntity
+       @RequestParam(required = false) search: String?
+   ): ResponseEntity<ApiResponse<Page<ResourceResponse>>> {
+       
+       val pageable = PaginationAndSearchHelper.createPageable(page, size, sort)
+       val results = PaginationAndSearchHelper.executeSearch(
+           search, pageable, service::search, service::findAll)
+       return ResponseEntity.ok(ApiResponse.success(results))
+   }
+   ```
+   - **ALWAYS use `PaginationAndSearchHelper`** to eliminate code duplication
+   - Return `Page<T>` not `List<T>` for list endpoints
+   - Default sort: `insertTime,desc` (uses `insertTime` from BaseEntity, not `createdAt`)
+
+**Note on Combined Roles:**
+* Users with both TENANT_ADMIN and FUNNEL_ADMIN roles will have both authorities in their JWT, so they can access both admin and funnel endpoints.
+
+---
+
+## Service Layer Development Rules
+
+### Service Structure
+1. **ALWAYS use these annotations:**
+   - `@Service`
+   - Primary constructor injection: `class XService(private val repository: XRepository)`
+   - Use `io.github.microutils:kotlin-logging` for logging: `private val log = logger()`
+
+2. **Transaction management:**
+   - Use `@Transactional(readOnly = true)` for read operations (findAll, findById)
+   - Use `@Transactional` for write operations (create, update, delete)
+   - **Saving Data Before Slow Operations**: When calling external services (AI, payment gateways, etc.):
+     - Save critical user data FIRST in a separate transaction (`TransactionTemplate` with `PROPAGATION_REQUIRES_NEW`)
+     - Then call the slow external service
+     - This ensures data persists even if external service fails or times out
+     - Benefits: User doesn't lose data, can retry operation later
+
+3. **Multi-tenancy awareness:**
+   - Add KDoc comment: "Operations are performed in the context of the current tenant schema."
+   - Services automatically work with current tenant via TenantContext
+
+### Error Handling in Services
+1. **ALWAYS throw meaningful exceptions:**
+```kotlin
+   throw ResourceNotFoundException("Resource not found with id: $resourceId")
+   ```
+
+2. **Check existence before delete:**
+   ```kotlin
+   if (!repository.existsById(resourceId)) {
+       throw ResourceNotFoundException("Resource not found with id: $resourceId")
+   }
+   ```
+
+### Logging (CRITICAL - Always Include IDs!)
+
+**Golden Rule:** Always log entity IDs for traceability and debugging.
+
+1. **ALWAYS include entity IDs in log messages:**
+   ```kotlin
+   // ✅ Good - includes entity ID
+   log.info { "Created resource: ${saved.name} with id: ${saved.id}" }
+   log.info { "Updated resource $id status to $status" }
+   log.info { "Retrieved resource $resourceId for user: $userEmail" }
+   
+   // ❌ Bad - missing entity ID
+   log.info { "Created resource: ${saved.name}" }
+   log.info { "Updated resource status" }
+   ```
+
+2. **Include contextual information for operations:**
+   ```kotlin
+   // Create operations: include name + ID
+   log.info { "Created resource: ${saved.name} with id: ${saved.id}" }
+   
+   // Update operations: include ID + what changed
+   log.info { "Updated resource with id: $resourceId, new status: $newStatus" }
+   
+   // Delete operations: include ID
+   log.info { "Deleted resource with id: $resourceId" }
+   
+   // Read operations: include ID + user context
+   log.info { "User $userEmail accessed resource $resourceId" }
+   ```
+
+3. **Security & access control logging:**
+   ```kotlin
+   // ALWAYS log security violations with IDs
+   log.warn { "User $userEmail attempted to access resource $resourceId owned by ${resource.ownerEmail}" }
+   
+   // ALWAYS log authentication events
+   log.info { "User $email logged in with role: $role" }
+   ```
+
+4. **Multi-step operation logging:**
+   ```kotlin
+   // Log each significant step with relevant IDs
+   log.info { "Initiating operation for user: $userEmail" }
+   log.info { "Created resource record with id: $resourceId" }
+   log.info { "Operation completed with transaction ID: $transactionId" }
+   ```
+
+5. **Error logging with context:**
+   ```kotlin
+   // Include entity IDs and context
+   log.error(ex) { "Failed to process resource $resourceId: ${ex.message}" }
+   log.error { "Resource not found for id: $resourceId" }
+   ```
+
+6. **Use appropriate log levels:**
+   - `log.debug { }` - Detailed debugging info (API URLs, request params)
+   - `log.info { }` - Normal operations (CRUD, business logic steps)
+   - `log.warn { }` - Recoverable issues (validation failures, deprecated usage)
+   - `log.error { }` - Errors that need attention (exceptions, security violations)
+
+7. **Avoid logging sensitive data:**
+   ```kotlin
+   // ✅ Good - no sensitive data
+   log.info { "Resource $resourceId processed for user: $userEmail" }
+   
+   // ❌ Bad - logs sensitive data
+   log.info { "Resource processed: $resource" } // May expose sensitive info
+   ```
+
+8. **Structured logging format:**
+   ```kotlin
+   // Prefer: "Action entityType ID for/with context"
+   log.info { "Created resource $resourceId for user: $userEmail" }
+   log.info { "Updated resource $resourceId to status: $newStatus" }
+   log.info { "Deleted resource $resourceId by admin: $adminEmail" }
+   ```
+
+### DTO Conversion
+
+**Kotlin-idiomatic approaches (choose based on context):**
+
+1. **Private helper functions (Simple & Clear - Recommended for most cases):**
+   ```kotlin
+   private fun toEntity(request: ResourceRequest): Resource {
+       // BaseEntity fields (id, insertTime, updateTime, insertUser, updateUser) are automatically set via Spring Data JPA Auditing
+       return Resource(
+           name = request.name
+       )
+   }
+   
+   private fun updateEntity(entity: Resource, request: ResourceRequest) {
+       entity.name = request.name
+       // Update other fields
+       // BaseEntity.updateTime and updateUser are automatically set via Spring Data JPA Auditing
+   }
+   
+   private fun toResponse(entity: Resource): ResourceResponse {
+       return ResourceResponse(
+           id = entity.id,
+           name = entity.name,
+           insertTime = entity.insertTime,  // From BaseEntity
+           updateTime = entity.updateTime,  // From BaseEntity
+           insertUser = entity.insertUser,  // From BaseEntity
+           updateUser = entity.updateUser   // From BaseEntity
+       )
+   }
+   ```
+
+2. **Extension functions (More Kotlin-idiomatic, useful for reusable conversions):**
+   ```kotlin
+   // In service class or as top-level private functions
+   private fun ResourceRequest.toEntity(): Resource {
+       // BaseEntity fields (id, insertTime, updateTime, insertUser, updateUser) are automatically set via Spring Data JPA Auditing
+       return Resource(
+           name = this.name
+       )
+   }
+   
+   private fun Resource.toResponse(): ResourceResponse {
+       return ResourceResponse(
+           id = this.id,
+           name = this.name,
+           insertTime = this.insertTime,  // From BaseEntity
+           updateTime = this.updateTime,  // From BaseEntity
+           insertUser = this.insertUser,  // From BaseEntity
+           updateUser = this.updateUser   // From BaseEntity
+       )
+   }
+   
+   // Usage:
+   val resource = request.toEntity()
+   val response = resource.toResponse()
+   ```
+
+3. **Using scope functions for updates (Very Kotlin-idiomatic):**
+   ```kotlin
+   private fun updateEntity(entity: Resource, request: ResourceRequest) {
+       entity.apply {
+           name = request.name
+           // Update other fields
+       }
+   }
+   ```
+
+**Recommendation:** 
+- **Use private helper functions** (approach #1) for service classes - they're clear, simple, and work well with Spring. This is the recommended approach for most cases.
+- **Use extension functions** (approach #2) if you prefer more Kotlin-idiomatic syntax and want a fluent API (e.g., `request.toEntity()` instead of `toEntity(request)`).
+- **For shared conversions across multiple services**: Create a separate mapper utility class or use a mapping library (e.g., MapStruct), rather than extension functions. Extension functions are better for adding behavior to types, not for sharing conversion logic.
+
+2. **Handle null foreign keys gracefully:**
+   ```kotlin
+   val city: City? = request.cityId?.let { cityId ->
+       cityRepository.findById(cityId)
+           .orElseThrow { ResourceNotFoundException("City not found with id: $cityId") }
+   }
+   ```
+
+---
+
+## Performance Optimization Guidelines (CRITICAL)
+
+**Purpose:** Prevent performance issues that can slow down your API and cause poor user experience. These guidelines help avoid common pitfalls like N+1 queries, inefficient loading, and excessive data transfer.
+
+### N+1 Query Problem Prevention
+
+**What is N+1 Query Problem?**
+
+When you fetch a list of entities and then access their relationships, Hibernate executes:
+- 1 query to fetch the list
+- N queries (one per entity) to fetch relationships
+
+**Example of N+1 Problem:**
+```kotlin
+// ❌ Bad - N+1 queries
+@Transactional(readOnly = true)
+fun findAllWithCity(): List<Resource> {
+    val resources = repository.findAll() // Query 1: SELECT * FROM resources
+    resources.forEach { resource ->
+        resource.city.name // Query 2, 3, 4... N: SELECT * FROM cities WHERE id = ?
+    }
+    // Total: 1 + N queries (if 100 resources = 101 queries!)
+    return resources
+}
+```
+
+**Solution 1: Use `@EntityGraph` (Recommended)**
+```kotlin
+// Repository
+interface ResourceRepository : JpaRepository<Resource, UUID>, JpaSpecificationExecutor<Resource> {
+    
+    @EntityGraph(attributePaths = ["city"])
+    override fun findAll(): List<Resource>
+    
+    @EntityGraph(attributePaths = ["city", "category"])
+    fun findAllWithRelations(): List<Resource>
+    
+    @EntityGraph(attributePaths = ["city"])
+    fun findById(id: UUID): Optional<Resource>
+}
+
+// Service
+@Transactional(readOnly = true)
+fun findAllWithCity(): List<Resource> {
+    return repository.findAll() // Single query with JOIN
+}
+```
+
+**Solution 2: Use Fetch Join in `@Query`**
+```kotlin
+interface ResourceRepository : JpaRepository<Resource, UUID> {
+    
+    @Query("SELECT r FROM Resource r JOIN FETCH r.city")
+    fun findAllWithCity(): List<Resource>
+    
+    @Query("SELECT r FROM Resource r JOIN FETCH r.city JOIN FETCH r.category")
+    fun findAllWithRelations(): List<Resource>
+}
+```
+
+**Solution 3: Use `@BatchSize` for Collections**
+```kotlin
+@Entity
+class Resource : BaseEntity() {
+    
+    @OneToMany(mappedBy = "resource", fetch = FetchType.LAZY)
+    @BatchSize(size = 20) // Fetch 20 at a time instead of one-by-one
+    val items: List<Item> = emptyList()
+}
+```
+
+**Rules:**
+- ✅ **ALWAYS** use `@EntityGraph` or `JOIN FETCH` when you know you'll access relationships
+- ✅ **ALWAYS** specify which relationships to fetch (don't fetch everything)
+- ✅ **ALWAYS** use `@BatchSize` for collections that might be large
+- ❌ **NEVER** access lazy relationships in a loop without fetching them first
+- ❌ **NEVER** use `FetchType.EAGER` on `@ManyToMany` or `@OneToMany` (causes performance issues)
+
+### Lazy Loading Guidelines
+
+**When to Use `FetchType.LAZY` (Default - Recommended):**
+- ✅ `@ManyToOne` relationships (most common case)
+- ✅ `@OneToMany` relationships (collections)
+- ✅ `@ManyToMany` relationships
+- ✅ When relationship might not be accessed
+- ✅ When you want to control when data is loaded
+
+**When to Use `FetchType.EAGER`:**
+- ✅ `@OneToOne` relationships (when always needed)
+- ✅ Small, always-needed relationships
+- ⚠️ **Use sparingly** - can cause performance issues if overused
+
+**Example:**
+```kotlin
+@Entity
+class Resource : BaseEntity() {
+    
+    // ✅ Good - LAZY (default, can be fetched when needed)
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "city_id")
+    val city: City? = null
+    
+    // ✅ Good - LAZY for collections (prevents loading all items)
+    @OneToMany(mappedBy = "resource", fetch = FetchType.LAZY)
+    val items: List<Item> = emptyList()
+    
+    // ⚠️ Use EAGER only when relationship is small and always needed
+    @OneToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "settings_id")
+    val settings: ResourceSettings? = null
+}
+```
+
+**Rules:**
+- ✅ **ALWAYS** use `LAZY` as default (it's the default, but be explicit)
+- ✅ **ALWAYS** fetch relationships explicitly when needed (`@EntityGraph`, `JOIN FETCH`)
+- ❌ **NEVER** use `EAGER` on `@OneToMany` or `@ManyToMany` (causes N+1 or cartesian product)
+- ❌ **NEVER** access lazy relationships outside transaction (causes `LazyInitializationException`)
+
+### Pagination Limits
+
+**Configuration:**
+```kotlin
+// Controller
+@GetMapping
+fun getAll(
+    @PathVariable tenantCode: String,
+    @RequestParam(defaultValue = "0") page: Int,
+    @RequestParam(defaultValue = "20") size: Int,
+    @RequestParam(defaultValue = "insertTime,desc") sort: String,
+    @RequestParam(required = false) search: String?
+): ResponseEntity<ApiResponse<Page<ResourceResponse>>> {
+    // Enforce max page size
+    val pageSize = minOf(size, 100) // Max 100 items per page
+    val pageable = PaginationAndSearchHelper.createPageable(page, pageSize, sort)
+    // ...
+}
+```
+
+**Default and Maximum Values:**
+- **Default page size:** 20 items (good balance between performance and usability)
+- **Maximum page size:** 100 items (prevents excessive data transfer and slow queries)
+- **Minimum page size:** 1 item (validation)
+
+**Rules:**
+- ✅ **ALWAYS** set a maximum page size (e.g., 100) to prevent DoS attacks
+- ✅ **ALWAYS** use reasonable defaults (20 items is a good default)
+- ✅ **ALWAYS** document pagination limits in API documentation
+- ✅ **ALWAYS** return `Page<T>` not `List<T>` for list endpoints
+- ❌ **NEVER** allow unlimited page size
+- ❌ **NEVER** return all records without pagination
+
+**Example Implementation:**
+```kotlin
+object PaginationAndSearchHelper {
+    private const val DEFAULT_PAGE_SIZE = 20
+    private const val MAX_PAGE_SIZE = 100
+    
+    fun createPageable(page: Int, size: Int, sort: String): Pageable {
+        val pageSize = size.coerceIn(1, MAX_PAGE_SIZE)
+        val sortObj = parseSort(sort)
+        return PageRequest.of(page, pageSize, sortObj)
+    }
+}
+```
+
+### Query Optimization Guidelines
+
+**1. Use `@Query` for Complex Queries:**
+```kotlin
+// ✅ Good - Use @Query for complex queries
+@Query("""
+    SELECT r FROM Resource r 
+    WHERE r.status = :status 
+    AND r.insertTime BETWEEN :startDate AND :endDate
+    ORDER BY r.insertTime DESC
+""")
+fun findByStatusAndDateRange(
+    @Param("status") status: ResourceStatus,
+    @Param("startDate") startDate: Instant,
+    @Param("endDate") endDate: Instant
+): List<Resource>
+
+// ❌ Bad - Method naming becomes too complex
+fun findByStatusAndInsertTimeBetweenAndInsertTimeIsNotNullOrderByInsertTimeDesc(...)
+```
+
+**3. Use Method Naming for Simple Queries:**
+```kotlin
+// ✅ Good - Simple queries with method naming
+fun findByStatus(status: ResourceStatus): List<Resource>
+fun findByCityIdAndStatus(cityId: UUID, status: ResourceStatus): List<Resource>
+fun existsByName(name: String): Boolean
+
+// ❌ Bad - Using @Query for simple queries (unnecessary)
+@Query("SELECT r FROM Resource r WHERE r.status = :status")
+fun findByStatus(@Param("status") status: ResourceStatus): List<Resource>
+```
+
+**4. Use Projections for Partial Data:**
+```kotlin
+// Interface projection (only selected fields)
+interface ResourceSummary {
+    val id: UUID
+    val name: String
+    val status: ResourceStatus
+}
+
+@Query("SELECT r.id as id, r.name as name, r.status as status FROM Resource r")
+fun findAllSummaries(): List<ResourceSummary>
+
+// DTO projection (custom DTO)
+data class ResourceSummaryDto(
+    val id: UUID,
+    val name: String,
+    val status: ResourceStatus
+)
+
+@Query("""
+    SELECT new com.example.dto.ResourceSummaryDto(r.id, r.name, r.status) 
+    FROM Resource r
+""")
+fun findAllSummaries(): List<ResourceSummaryDto>
+```
+
+**Rules:**
+- ✅ **ALWAYS** use `@Query` for complex queries (multiple conditions, joins, subqueries)
+- ✅ **ALWAYS** use method naming for simple queries (single condition, simple sorting)
+- ✅ **ALWAYS** use projections when you only need a subset of fields
+- ✅ **ALWAYS** create indexes on frequently queried columns
+- ❌ **NEVER** use `SELECT *` when you only need specific fields
+- ❌ **NEVER** fetch more data than needed
+
+### Bulk Operation Patterns
+
+**1. Batch Inserts:**
+```kotlin
+@Service
+class ResourceService(
+    private val repository: ResourceRepository
+) {
+    
+    @Transactional
+    fun createBatch(requests: List<ResourceRequest>): List<Resource> {
+        // Convert all at once
+        val resources = requests.map { it.toEntity() }
+        
+        // Save all in one batch (if batch size configured)
+        return repository.saveAll(resources)
+    }
+}
+```
+
+**2. Batch Updates:**
+```kotlin
+@Modifying
+@Query("UPDATE Resource r SET r.status = :status WHERE r.id IN :ids")
+fun updateStatusBatch(@Param("ids") ids: List<UUID>, @Param("status") ResourceStatus): Int
+
+// Usage
+@Transactional
+fun updateStatusBatch(ids: List<UUID>, status: ResourceStatus) {
+    repository.updateStatusBatch(ids, status)
+}
+```
+
+**3. Batch Deletes:**
+```kotlin
+@Modifying
+@Query("DELETE FROM Resource r WHERE r.id IN :ids")
+fun deleteBatch(@Param("ids") ids: List<UUID>): Int
+
+// Usage
+@Transactional
+fun deleteBatch(ids: List<UUID>) {
+    repository.deleteBatch(ids)
+}
+```
+
+**4. Configuration for Batch Processing:**
+```yaml
+# application.yml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 20  # Batch 20 inserts/updates together
+        order_inserts: true  # Group inserts together
+        order_updates: true   # Group updates together
+```
+
+**Rules:**
+- ✅ **ALWAYS** use `saveAll()` for batch inserts (more efficient than individual saves)
+- ✅ **ALWAYS** use `@Modifying` with `@Query` for bulk updates/deletes
+- ✅ **ALWAYS** configure batch size in `application.yml`
+- ✅ **ALWAYS** use transactions for bulk operations
+- ❌ **NEVER** use individual `save()` calls in a loop
+- ❌ **NEVER** fetch all entities just to update them (use bulk update query instead)
+
+### Performance Checklist
+
+**Before deploying, check:**
+- [ ] Are relationships fetched efficiently (`@EntityGraph` or `JOIN FETCH`)?
+- [ ] Are lazy relationships accessed within transactions?
+- [ ] Is pagination implemented with max page size?
+- [ ] Are indexes created on frequently queried columns?
+- [ ] Are complex queries using `@Query` instead of method naming?
+- [ ] Are bulk operations using batch processing?
+- [ ] Are projections used when only partial data is needed?
+- [ ] Is `FetchType.EAGER` avoided on collections?
+
+---
+
+## Testing Requirements
+
+### When to Write Tests
+**MANDATORY: Write tests for EVERY new implementation!**
+
+1. **Unit Tests (with MockK):**
+   - Write for ALL service methods
+   - Mock repository dependencies using MockK
+   - Test business logic in isolation
+   - File naming: `*Test.kt`
+
+2. **Integration Tests (with Testcontainers):**
+   - Write for complex controller flows
+   - Test end-to-end API behavior
+   - Use real PostgreSQL container (postgres:17-alpine)
+   - File naming: `*IntegrationTest.kt`
+
+### Test Requirements Checklist
+After implementing ANY new feature:
+1. ✅ Write unit tests for service layer
+2. ✅ Write integration tests for complex flows
+3. ✅ Run tests: `mvn test`
+4. ✅ Check coverage: `mvn verify jacoco:report`
+5. ✅ Ensure 80% minimum coverage maintained
+6. ✅ **ALL TESTS MUST PASS before considering work complete**
+
+### Integration Test Pattern
+**ALWAYS use this structure for integration tests:**
+```kotlin
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Testcontainers
+@ActiveProfiles("test")
+class ResourceControllerIntegrationTest {
+    
+    companion object {
+        @Container
+        @JvmStatic
+        val postgres = PostgreSQLContainer<Nothing>("postgres:17-alpine").apply {
+            withDatabaseName("test")
+            withUsername("test")
+            withPassword("test")
+        }
+        
+        @JvmStatic
+        @DynamicPropertySource
+        fun configureProperties(registry: DynamicPropertyRegistry) {
+            registry.add("spring.datasource.url") { postgres.jdbcUrl }
+            registry.add("spring.datasource.username") { postgres.username }
+            registry.add("spring.datasource.password") { postgres.password }
+        }
+    }
+    
+    @BeforeEach
+    fun setUp() {
+        // Set up test tenant for localhost
+        jdbcTemplate.execute("""
+            INSERT INTO public.tenants (tenant_id, domain, name, active) 
+            VALUES ('test', 'localhost', 'Test Tenant', true) 
+            ON CONFLICT (domain) DO NOTHING
+        """.trimIndent())
+    }
+    
+    @AfterEach
+    fun tearDown() {
+        TenantContext.clear()
+    }
+}
+```
+
+### Unit Test Pattern (MockK)
+```kotlin
+@ExtendWith(MockKExtension::class)
+class ResourceServiceTest {
+    
+    @MockK
+    private lateinit var repository: ResourceRepository
+    
+    @InjectMockKs
+    private lateinit var service: ResourceService
+    
+    @Test
+    fun `findById should return resource when exists`() {
+        // Given, When, Then pattern
+        val resourceId = UUID.randomUUID()
+        val resource = Resource(name = "Test").apply { id = resourceId }
+        
+        every { repository.findById(resourceId) } returns Optional.of(resource)
+        
+        val result = service.findById(resourceId)
+        
+        assertEquals(resource, result)
+        verify(exactly = 1) { repository.findById(resourceId) }
+    }
+}
+```
+
+### Test Data Builders/Fixtures Pattern (Recommended for Maintainable Tests)
+
+**Purpose:** Create reusable test data with sensible defaults to reduce duplication and improve maintainability.
+
+**Why Use This Pattern:**
+- ✅ **DRY Principle**: Define test data once, reuse everywhere
+- ✅ **Maintainability**: When entity structure changes, update one place
+- ✅ **Readability**: `ResourceTestData.aResource()` is clearer than long builder chains
+- ✅ **Flexibility**: Easy to override specific fields while keeping defaults
+- ✅ **Consistency**: Same test data structure across all tests
+
+**Implementation Pattern:**
+
+Create test data builders as Kotlin `object` singletons with default parameters:
+
+```kotlin
+// test/fixtures/ResourceTestData.kt
+object ResourceTestData {
+    fun aResource(
+        id: UUID? = UUID.randomUUID(),
+        name: String = "Test Resource",
+        status: String = "ACTIVE",
+        amount: BigDecimal = BigDecimal("100.00"),
+        insertTime: Instant? = Instant.now()
+    ): Resource {
+        return Resource(
+            id = id,
+            name = name,
+            status = status,
+            amount = amount,
+            insertTime = insertTime
+        )
+    }
+    
+    // Convenience methods for common variations
+    fun anInactiveResource() = aResource(status = "INACTIVE")
+    fun anExpensiveResource() = aResource(amount = BigDecimal("1000.00"))
+    fun aResourceWithCustomName(name: String) = aResource(name = name)
+}
+```
+
+**Usage in Tests:**
+
+```kotlin
+@Test
+fun `should find resource by id`() {
+    // Use all defaults
+    val resource = ResourceTestData.aResource()
+    
+    every { repository.findById(resource.id!!) } returns Optional.of(resource)
+    val result = service.findById(resource.id!!)
+    
+    assertEquals(resource, result)
+}
+
+@Test
+fun `should filter inactive resources`() {
+    // Use convenience method
+    val inactiveResource = ResourceTestData.anInactiveResource()
+    // Test logic...
+}
+
+@Test
+fun `should handle custom resource`() {
+    // Override specific fields
+    val customResource = ResourceTestData.aResource(
+        name = "Custom Name",
+        amount = BigDecimal("500.00")
+    )
+    // Test logic...
+}
+```
+
+**When to Use Builders vs Direct Instantiation:**
+
+✅ **Use builders when:**
+- Entity has many fields (5+)
+- Same entity is used in multiple tests
+- You want default values for common fields
+- Entity structure changes frequently
+
+✅ **Use direct instantiation when:**
+- Entity is simple (few fields)
+- Only used once in a test
+- Need full control over all fields
+- Testing entity construction itself
+
+**Test Isolation and Cleanup:**
+
+1. **Unit Tests (MockK):**
+   - No cleanup needed (mocked dependencies)
+   - Use unique IDs: `ResourceTestData.aResource(id = UUID.randomUUID())`
+
+2. **Integration Tests (Testcontainers):**
+   ```kotlin
+   @BeforeEach
+   fun setUp() {
+       // Clean database before each test
+       jdbcTemplate.execute("TRUNCATE TABLE resources CASCADE")
+       // Or use @Sql annotation
+   }
+   
+   @AfterEach
+   fun tearDown() {
+       TenantContext.clear()
+       // Optional: Clean up test data if needed
+   }
+   ```
+
+3. **Transactional Tests (Auto-rollback):**
+   ```kotlin
+   @Transactional
+   @Test
+   fun `test with transaction`() {
+       val resource = ResourceTestData.aResource()
+       repository.save(resource)
+       // Data is automatically rolled back after test
+   }
+   ```
+
+**Rules:**
+- ✅ Create test data builders in `test/fixtures/` package
+- ✅ Use `object` singleton pattern (no instantiation needed)
+- ✅ Provide sensible defaults for all fields
+- ✅ Use named parameters for clarity
+- ✅ Create convenience methods for common variations
+- ✅ Keep builders close to the entity they create (same package structure)
+
+---
+
+## BaseEntity Pattern (CRITICAL - All Entities Must Extend This)
+
+**All entities MUST extend `BaseEntity` which provides:**
+- `id: UUID` (primary key, auto-generated)
+- `insertTime: Instant?` (automatically set on creation via Spring Data JPA Auditing)
+- `updateTime: Instant?` (automatically set on creation and updates via Spring Data JPA Auditing)
+- `insertUser: String?` (email of user who created, automatically set via `AuditorAware` from SecurityContext)
+- `updateUser: String?` (email of user who last updated, automatically set via `AuditorAware` from SecurityContext)
+
+**CRITICAL**: Requires `@EnableJpaAuditing` configuration with `AuditorAware<String>` bean (see JpaAuditingConfig below).
+
+### BaseEntity Implementation
+
+**Location:** `common/model/entity/BaseEntity.kt`
+
+```kotlin
+package com.triariigrowth.funnel.common.model.entity
+
+import jakarta.persistence.*
+import org.springframework.data.annotation.CreatedBy
+import org.springframework.data.annotation.CreatedDate
+import org.springframework.data.annotation.LastModifiedBy
+import org.springframework.data.annotation.LastModifiedDate
+import org.springframework.data.jpa.domain.support.AuditingEntityListener
+import java.time.Instant
+import java.util.*
+
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener::class)
+open class BaseEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    open var id: UUID? = null
+    
+    @CreatedDate
+    @Column(name = "insert_time", nullable = false, updatable = false)
+    open var insertTime: Instant? = null
+    
+    @LastModifiedDate
+    @Column(name = "update_time", nullable = false)
+    open var updateTime: Instant? = null
+    
+    @CreatedBy
+    @Column(name = "insert_user", length = 255)
+    open var insertUser: String? = null
+    
+    @LastModifiedBy
+    @Column(name = "update_user", length = 255)
+    open var updateUser: String? = null
+}
+```
+
+**Configuration Required:** `common/config/JpaAuditingConfig.kt`
+
+```kotlin
+package com.triariigrowth.funnel.common.config
+
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.data.domain.AuditorAware
+import org.springframework.data.jpa.repository.config.EnableJpaAuditing
+import org.springframework.security.core.context.SecurityContextHolder
+import java.util.*
+
+/**
+ * Enables JPA Auditing for BaseEntity.
+ * Automatically sets insertTime, updateTime, insertUser, updateUser via Spring Data JPA.
+ */
+@Configuration
+@EnableJpaAuditing
+class JpaAuditingConfig {
+    
+    @Bean
+    fun auditorProvider(): AuditorAware<String> {
+        return AuditorAware { 
+            Optional.ofNullable(
+                SecurityContextHolder.getContext().authentication?.name
+            )
+        }
+    }
+}
+```
+
+### Entity Pattern (All Entities Must Extend BaseEntity)
+
+```kotlin
+@Entity
+@Table(name = "resources")
+open class Resource(
+    // Inherits: id, insertTime, updateTime, insertUser, updateUser from BaseEntity
+    @Column(name = "name", nullable = false)
+    open var name: String = ""
+) : BaseEntity()
+```
+
+**Rules:**
+- ✅ **ALL entities** (platform and tenant) must extend `BaseEntity`
+- ✅ Use `UUID` for all entity IDs (not `Long`)
+- ✅ Timestamps and user fields are automatically managed via Spring Data JPA Auditing
+- ✅ `insertUser`/`updateUser` are nullable (for system-generated records or anonymous operations)
+- ✅ `insertTime`/`updateTime` are automatically set by Spring - never set them manually
+- ✅ **CRITICAL**: Must have `@EnableJpaAuditing` configuration with `AuditorAware` bean (see JpaAuditingConfig above)
+
+## Repository Layer Rules
+
+### Repository Structure
+1. **Extend JpaRepository and JpaSpecificationExecutor with UUID:**
+   ```kotlin
+   interface ResourceRepository : JpaRepository<Resource, UUID>, JpaSpecificationExecutor<Resource> {
+       // Custom queries
+   }
+   ```
+   
+   **CRITICAL**: All repositories must use `UUID` as the ID type, not `Long`.
+
+2. **Query method naming:**
+   - Use Spring Data JPA method naming conventions
+   - Example: `fun findByInsertTimeAfterOrderByInsertTimeAsc(date: Instant): List<Resource>`
+   - Complex queries: use `@Query` annotation
+   - **Note:** Use `Instant` type for datetime parameters, `LocalDate` for date-only parameters
+
+3. **Specification Support:**
+   - ALWAYS extend `JpaSpecificationExecutor<T>` for search functionality
+   - Enables dynamic filtering with JPA Specifications
+
+---
+
+## JPA Specification Development Rules (For Search Functionality)
+
+### Creating a New Specification Class
+1. **ALWAYS extend BaseSpecification:**
+   ```kotlin
+   object ResourceSpecification : BaseSpecification() {
+       fun search(searchTerm: String?): Specification<Resource> {
+           return Specification { root, query, criteriaBuilder ->
+               if (!isSearchTermValid(searchTerm)) {
+                   return@Specification criteriaBuilder.conjunction()
+               }
+               
+               val searchPattern = toLikePattern(searchTerm!!)
+               val predicates = mutableListOf<Predicate>()
+               
+               // String fields
+               predicates.add(createLikePredicate(criteriaBuilder, root.get<String>("name"), searchPattern))
+               
+               // Date fields
+               predicates.add(createInstantSearchPredicate(criteriaBuilder, root.get<Instant>("insertTime"), searchPattern))
+               predicates.add(createInstantSearchPredicate(criteriaBuilder, root.get<Instant>("updateTime"), searchPattern))
+               
+               // Numeric fields
+               predicates.add(createBigDecimalSearchPredicate(criteriaBuilder, root.get<BigDecimal>("amount"), searchPattern))
+               
+               combineWithOr(criteriaBuilder, predicates)
+           }
+       }
+   }
+   ```
+
+2. **Use BaseSpecification helper methods:**
+   - `isSearchTermValid(searchTerm)` - Validates search term
+   - `toLikePattern(searchTerm)` - Creates "%value%" pattern
+   - `createLikePredicate()` - For string fields
+   - `createInstantSearchPredicate()` - For Instant date fields
+   - `createLocalDateSearchPredicate()` - For LocalDate fields
+   - `createBigDecimalSearchPredicate()` - For numeric fields
+   - `combineWithOr()` - Combines predicates with OR logic
+
+3. **Searchable Field Guidelines:**
+   - ✅ Include user-identifiable fields (name, email, phone)
+   - ✅ Include status/enum fields
+   - ✅ Include date fields (insertTime, updateTime from BaseEntity, eventDate, etc.)
+   - ✅ Include numeric fields that users might search (fees, amounts)
+   - ✅ Include description/text fields
+   - ❌ Don't include technical IDs or internal fields
+   - ❌ Don't include binary/large object fields
+
+4. **Testing Specifications:**
+   - Write unit tests for null/empty search terms
+   - Test that specification is created successfully
+   - No need to mock entire JPA criteria API
+
+---
+
+## DTO Development Rules
+
+### Request DTOs
+1. **ALWAYS include validation annotations:**
+   ```kotlin
+   data class ResourceRequest(
+       @field:NotBlank(message = "Name is required")
+       @field:Size(max = 255, message = "Name must not exceed 255 characters")
+       val name: String,
+       
+      @field:NotNull(message = "Date is required")
+      val date: Instant
+   )
+   ```
+   
+   **See Input Validation & Sanitization Guidelines section for comprehensive validation patterns and examples.**
+
+2. **Use Kotlin `data class` with validation:**
+   - `data class` for immutability
+   - Use `@field:` prefix for validation annotations on constructor properties
+
+### Response DTOs
+1. **Include all necessary fields from entity**
+2. **Flatten relationships (e.g., cityName instead of full City object)**
+3. **Include BaseEntity timestamps when relevant:**
+   - Include `insertTime`, `updateTime`, `insertUser`, `updateUser` from BaseEntity in response DTOs when audit trail is needed
+   - For list endpoints, these fields are optional (can exclude for performance)
+4. **Admin/Funnel Response DTOs - Exclude Large Data in Pagination:**
+   - **Performance**: Admin/Funnel list endpoints should NOT include large data fields when paginating
+   - Large data fields can significantly increase response payload size and slow down pagination
+   - Use boolean flags to indicate existence without sending the full data:
+     - `hasReport` (boolean) - Indicates if report exists without including `reportText` (can be 5-10KB+)
+     - `hasAnswers` (boolean) - Indicates if answers exist without including `answers` data (JSONB field)
+   - This pattern keeps pagination responses lightweight and performant
+   - **Note**: Admins are trusted - this is about performance, not security
+
+---
+
+## Input Validation & Sanitization Guidelines (CRITICAL - Security)
+
+**Purpose:** Prevent security vulnerabilities by validating and sanitizing all user input before processing.
+
+### Built-in Validation Annotations
+
+**Location:** `jakarta.validation.constraints.*` (Bean Validation / JSR 303)
+
+**Common Annotations:**
+```kotlin
+data class UserRequest(
+    @field:NotBlank(message = "Email is required")
+    @field:Email(message = "Email must be valid")
+    @field:Size(max = 255, message = "Email must not exceed 255 characters")
+    val email: String,
+    
+    @field:NotNull(message = "Age is required")
+    @field:Min(value = 0, message = "Age must be positive")
+    @field:Max(value = 150, message = "Age must be realistic")
+    val age: Int?,
+    
+    @field:Size(min = 8, max = 100, message = "Password must be 8-100 characters")
+    @field:Pattern(
+        regexp = "^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).+$",
+        message = "Password must contain uppercase, lowercase, and number"
+    )
+    val password: String?,
+    
+    @field:NotNull(message = "Birth date is required")
+    @field:Past(message = "Birth date must be in the past")
+    val birthDate: LocalDate,  // Date-only field (no time needed)
+    
+    @field:NotNull(message = "Event datetime is required")
+    @field:Future(message = "Event datetime must be in the future")
+    val eventDateTime: Instant,  // Datetime field (time matters)
+    
+    @field:DecimalMin(value = "0.0", inclusive = false, message = "Price must be positive")
+    @field:Digits(integer = 10, fraction = 2, message = "Price format invalid")
+    val price: BigDecimal?,
+    
+    @field:URL(message = "Website must be a valid URL")
+    val website: String?,
+    
+    @field:AssertTrue(message = "Terms must be accepted")
+    val termsAccepted: Boolean
+)
+```
+
+**Rules:**
+1. **ALWAYS use `@field:` prefix** for validation annotations on `data class` constructor properties
+2. **ALWAYS provide meaningful error messages** - these are shown to users
+3. **ALWAYS use appropriate datetime/date types when receiving from frontend:**
+   
+   **For Datetime Fields (when time matters):**
+   ```kotlin
+   // ✅ Good - Instant type for datetime (with time)
+   @field:NotNull(message = "Event datetime is required")
+   @field:Future(message = "Event datetime must be in the future")
+   val eventDateTime: Instant
+   
+   // ❌ Bad - LocalDateTime (use Instant instead)
+   @field:NotNull(message = "Event datetime is required")
+   val eventDateTime: LocalDateTime
+   
+   // ❌ Bad - nullable, optional (only use if truly optional)
+   @field:Future(message = "Event datetime must be in the future")
+   val eventDateTime: Instant?
+   ```
+   **Rationale for `Instant` (datetime):**
+   - Frontend sends datetime values as ISO-8601 timestamps (UTC)
+   - `Instant` represents a point in time in UTC, perfect for API communication
+   - `Instant` is timezone-agnostic and avoids timezone conversion issues
+   - Use for: event start/end times, created/updated timestamps, scheduled times
+   
+   **For Date-Only Fields (when only date matters, no time):**
+   ```kotlin
+   // ✅ Good - LocalDate type for date-only (no time)
+   @field:NotNull(message = "Birth date is required")
+   @field:Past(message = "Birth date must be in the past")
+   val birthDate: LocalDate
+   
+   // ✅ Good - LocalDate for date-only fields
+   @field:NotNull(message = "Event date is required")
+   @field:Future(message = "Event date must be in the future")
+   val eventDate: LocalDate
+   
+   // ❌ Bad - Using Instant for date-only fields (unnecessary precision)
+   @field:NotNull(message = "Birth date is required")
+   val birthDate: Instant  // Overkill - time not needed
+   ```
+   **Rationale for `LocalDate` (date-only):**
+   - Frontend sends date values as ISO-8601 date strings (YYYY-MM-DD)
+   - `LocalDate` represents just a date without time component
+   - More semantic and appropriate when time doesn't matter
+   - Use for: birth dates, event dates (if time not needed), deadlines (if time not needed), expiration dates
+   
+   **General Rules:**
+   - Use `Instant` for datetime fields (when time matters)
+   - Use `LocalDate` for date-only fields (when only date matters)
+   - Always use non-nullable types with `@NotNull` validation
+   - Only make nullable if the field is truly optional
+4. **ALWAYS validate at controller level** with `@Valid` annotation:
+   ```kotlin
+   @PostMapping
+   fun create(
+       @PathVariable tenantCode: String,
+       @Valid @RequestBody request: ResourceRequest
+   ): ResponseEntity<ApiResponse<ResourceResponse>> {
+       // Validation happens automatically before this method is called
+   }
+   ```
+
+### Custom Validators
+
+**When to Use:**
+- Complex business rules (e.g., "end date must be after start date")
+- Cross-field validation (e.g., "password confirmation must match password")
+- Tenant-specific validation rules
+- Custom format validation not covered by built-in annotations
+
+**Implementation Pattern:**
+```kotlin
+// 1. Create annotation
+@Target(AnnotationTarget.FIELD, AnnotationTarget.VALUE_PARAMETER)
+@Retention(AnnotationRetention.RUNTIME)
+@Constraint(validatedBy = [ValidEmailDomainValidator::class])
+annotation class ValidEmailDomain(
+    val message: String = "Email domain not allowed",
+    val groups: Array<KClass<*>> = [],
+    val payload: Array<KClass<out Payload>> = []
+)
+
+// 2. Create validator class
+class ValidEmailDomainValidator : ConstraintValidator<ValidEmailDomain, String> {
+    private val allowedDomains = setOf("example.com", "company.com")
+    
+    override fun isValid(value: String?, context: ConstraintValidatorContext?): Boolean {
+        if (value.isNullOrBlank()) return true // Let @NotBlank handle null/empty
+        
+        val domain = value.substringAfter("@")
+        return allowedDomains.contains(domain)
+    }
+}
+
+// 3. Use in DTO
+data class UserRequest(
+    @field:ValidEmailDomain(message = "Only company email domains allowed")
+    val email: String
+)
+```
+
+**Cross-Field Validation Example:**
+```kotlin
+// 1. Class-level annotation
+@Target(AnnotationTarget.TYPE)
+@Retention(AnnotationRetention.RUNTIME)
+@Constraint(validatedBy = [DateRangeValidator::class])
+annotation class ValidDateRange(
+    val message: String = "End date must be after start date",
+    val groups: Array<KClass<*>> = [],
+    val payload: Array<KClass<out Payload>> = []
+)
+
+// 2. Validator
+class DateRangeValidator : ConstraintValidator<ValidDateRange, EventRequest> {
+    override fun isValid(value: EventRequest?, context: ConstraintValidatorContext?): Boolean {
+        if (value == null) return true
+        
+        return value.endDate.isAfter(value.startDate)
+    }
+}
+
+// 3. Use on DTO class
+@ValidDateRange
+data class EventRequest(
+    // Option 1: If time matters (use Instant)
+    @field:NotNull(message = "Start datetime is required")
+    val startDateTime: Instant,
+    
+    @field:NotNull(message = "End datetime is required")
+    val endDateTime: Instant
+    
+    // Option 2: If only date matters (use LocalDate)
+    // @field:NotNull(message = "Start date is required")
+    // val startDate: LocalDate,
+    // 
+    // @field:NotNull(message = "End date is required")
+    // val endDate: LocalDate
+)
+```
+
+### Input Sanitization (Preventing Security Vulnerabilities)
+
+**CRITICAL:** Validation ensures data format is correct, but **sanitization removes dangerous content**.
+
+#### 1. SQL Injection Prevention
+
+**✅ ALWAYS use JPA/Hibernate (Parameterized Queries):**
+```kotlin
+// ✅ Good - JPA handles parameterization automatically
+@Query("SELECT r FROM Resource r WHERE r.name = :name")
+fun findByName(@Param("name") name: String): List<Resource>
+
+// ✅ Good - Spring Data method naming (safe)
+fun findByName(name: String): List<Resource>
+
+// ❌ NEVER do this - SQL injection risk!
+@Query("SELECT * FROM resources WHERE name = '$name'", nativeQuery = true)
+fun findByNameUnsafe(name: String): List<Resource>
+```
+
+**Rules:**
+- ✅ **ALWAYS** use parameterized queries (`:param` or `?1`, `?2`)
+- ✅ **ALWAYS** use Spring Data JPA method naming when possible
+- ❌ **NEVER** concatenate user input into SQL strings
+- ❌ **NEVER** use native queries with string interpolation
+
+#### 2. XSS (Cross-Site Scripting) Prevention
+
+**For Text Fields (User-Generated Content):**
+```kotlin
+// Option 1: HTML Escaping (Recommended for most cases)
+// Spring automatically escapes HTML in Thymeleaf templates
+// For API responses, frontend should escape HTML
+
+// Option 2: HTML Sanitization (If HTML is allowed)
+import org.jsoup.Jsoup
+import org.jsoup.safety.Safelist
+
+fun sanitizeHtml(input: String): String {
+    // Remove all HTML tags (most restrictive)
+    return Jsoup.clean(input, Safelist.none())
+    
+    // OR allow safe HTML tags only
+    // return Jsoup.clean(input, Safelist.basic())
+}
+
+// Usage in service
+fun createComment(content: String): Comment {
+    val sanitizedContent = sanitizeHtml(content)
+    return Comment(content = sanitizedContent)
+}
+```
+
+**Rules:**
+- ✅ **ALWAYS** escape HTML in user-generated content displayed in UI
+- ✅ **ALWAYS** sanitize HTML if you allow HTML input (use library like JSoup)
+- ✅ **ALWAYS** use Content Security Policy (CSP) headers
+- ❌ **NEVER** trust user input - always sanitize before storing/displaying
+
+#### 3. Path Traversal Prevention
+
+**For File Uploads/Paths:**
+```kotlin
+import java.nio.file.Paths
+
+fun validateFilePath(userInput: String): String {
+    // Normalize path to prevent ../ attacks
+    val normalized = Paths.get(userInput).normalize().toString()
+    
+    // Ensure path doesn't escape allowed directory
+    val allowedBase = Paths.get("/uploads")
+    val resolved = allowedBase.resolve(normalized).normalize()
+    
+    // Verify resolved path is still within allowed base
+    require(resolved.startsWith(allowedBase)) {
+        "Path traversal detected: $userInput"
+    }
+    
+    return resolved.toString()
+}
+```
+
+**Rules:**
+- ✅ **ALWAYS** normalize file paths
+- ✅ **ALWAYS** validate resolved path is within allowed directory
+- ✅ **ALWAYS** use `Paths.get().normalize()` before processing
+- ❌ **NEVER** use user input directly as file paths
+
+#### 4. Command Injection Prevention
+
+**For System Commands:**
+```kotlin
+// ❌ NEVER do this - command injection risk!
+Runtime.getRuntime().exec("ls $userInput")
+
+// ✅ Good - use ProcessBuilder with separate arguments
+fun safeCommandExecution(command: List<String>) {
+    ProcessBuilder(command)
+        .directory(File("/safe/directory"))
+        .start()
+}
+
+// ✅ Better - avoid system commands entirely, use libraries
+// Instead of: Runtime.exec("convert image.jpg image.png")
+// Use: ImageIO library or similar
+```
+
+**Rules:**
+- ❌ **NEVER** execute system commands with user input
+- ✅ **ALWAYS** use libraries instead of system commands when possible
+- ✅ **ALWAYS** use `ProcessBuilder` with separate arguments if commands are necessary
+- ✅ **ALWAYS** validate and whitelist allowed commands
+
+### File Upload Validation
+
+**File Upload Pattern (Reusable Service - DRY Principle):**
+
+**CRITICAL:** Don't repeat validation logic in every controller method. Use a reusable service instead.
+
+**1. Create File Type Enum (Predefined Configurations):**
+```kotlin
+enum class FileType(
+    val maxSize: Long,
+    val allowedExtensions: Set<String>,
+    val allowedMimeTypes: Set<String>
+) {
+    PROFILE_PICTURE(
+        maxSize = 2 * 1024 * 1024, // 2MB
+        allowedExtensions = setOf("jpg", "jpeg", "png"),
+        allowedMimeTypes = setOf("image/jpeg", "image/png")
+    ),
+    
+    DOCUMENT(
+        maxSize = 50 * 1024 * 1024, // 50MB
+        allowedExtensions = setOf("pdf", "doc", "docx"),
+        allowedMimeTypes = setOf("application/pdf", "application/msword")
+    ),
+    
+    AVATAR(
+        maxSize = 500 * 1024, // 500KB
+        allowedExtensions = setOf("jpg", "jpeg", "png", "gif"),
+        allowedMimeTypes = setOf("image/jpeg", "image/png", "image/gif")
+    ),
+    
+    GENERAL_IMAGE(
+        maxSize = 10 * 1024 * 1024, // 10MB
+        allowedExtensions = setOf("jpg", "jpeg", "png", "gif", "webp"),
+        allowedMimeTypes = setOf("image/jpeg", "image/png", "image/gif", "image/webp")
+    )
+}
+```
+
+**2. Create File Validation Service:**
+```kotlin
+@Service
+class FileValidationService {
+    
+    /**
+     * Validate file using predefined file type configuration.
+     * Use this for common file types (profile pictures, documents, etc.)
+     */
+    fun validateFile(
+        file: MultipartFile,
+        fileType: FileType
+    ): ValidatedFile {
+        return validateFile(
+            file = file,
+            maxSize = fileType.maxSize,
+            allowedExtensions = fileType.allowedExtensions,
+            allowedMimeTypes = fileType.allowedMimeTypes
+        )
+    }
+    
+    /**
+     * Validate file with custom configuration.
+     * Use this when predefined types don't fit your needs.
+     */
+    fun validateFile(
+        file: MultipartFile,
+        maxSize: Long,
+        allowedExtensions: Set<String>,
+        allowedMimeTypes: Set<String>
+    ): ValidatedFile {
+        // 1. Validate file size
+        require(file.size <= maxSize) {
+            "File size exceeds maximum allowed size of ${maxSize / 1024 / 1024}MB"
+        }
+        
+        // 2. Validate file type (extension)
+        val extension = file.originalFilename?.substringAfterLast('.', "")?.lowercase()
+        require(extension != null && extension in allowedExtensions) {
+            "File type not allowed. Allowed: ${allowedExtensions.joinToString()}"
+        }
+        
+        // 3. Validate MIME type (content type)
+        require(file.contentType in allowedMimeTypes) {
+            "File content type not allowed: ${file.contentType}"
+        }
+        
+        // 4. Validate file content (magic bytes / file signature)
+        val fileBytes = file.bytes
+        require(isValidFileContent(fileBytes, extension)) {
+            "File content does not match file extension"
+        }
+        
+        // 5. Sanitize filename
+        val sanitizedFilename = sanitizeFilename(file.originalFilename ?: "file")
+        
+        return ValidatedFile(
+            file = file,
+            sanitizedFilename = sanitizedFilename,
+            extension = extension
+        )
+    }
+    
+    private fun isValidFileContent(bytes: ByteArray, extension: String): Boolean {
+        // Check magic bytes (file signature)
+        return when (extension) {
+            "jpg", "jpeg" -> bytes.startsWith(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()))
+            "png" -> bytes.startsWith(byteArrayOf(0x89.toByte(), 0x50.toByte(), 0x4E.toByte(), 0x47.toByte()))
+            "pdf" -> bytes.startsWith("%PDF".toByteArray())
+            "gif" -> bytes.startsWith("GIF89a".toByteArray()) || bytes.startsWith("GIF87a".toByteArray())
+            "webp" -> bytes.size >= 12 && bytes.sliceArray(0..3).contentEquals("RIFF".toByteArray()) &&
+                      bytes.sliceArray(8..11).contentEquals("WEBP".toByteArray())
+            else -> false
+        }
+    }
+    
+    private fun sanitizeFilename(filename: String): String {
+        // Remove path separators and dangerous characters
+        return filename
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_") // Replace dangerous chars
+            .replace(Regex("\\.\\."), "_") // Replace .. (path traversal)
+            .take(255) // Limit length
+    }
+}
+
+data class ValidatedFile(
+    val file: MultipartFile,
+    val sanitizedFilename: String,
+    val extension: String
+)
+```
+
+**3. Usage in Controllers (Clean and Simple):**
+```kotlin
+@RestController
+@RequestMapping(BasePaths.ADMIN_RESOURCES)
+class AdminResourceController(
+    private val fileValidationService: FileValidationService
+) {
+    
+    // Profile picture - uses predefined configuration
+    @PostMapping("/profile-picture")
+    fun uploadProfilePicture(
+        @PathVariable tenantCode: String,
+        @RequestParam("file") file: MultipartFile
+    ): ResponseEntity<ApiResponse<FileUploadResponse>> {
+        // One line - all validation done!
+        val validated = fileValidationService.validateFile(file, FileType.PROFILE_PICTURE)
+        
+        // Use validated.file, validated.sanitizedFilename, validated.extension
+        // Process file...
+    }
+    
+    // Document upload - different configuration
+    @PostMapping("/documents")
+    fun uploadDocument(
+        @PathVariable tenantCode: String,
+        @RequestParam("file") file: MultipartFile
+    ): ResponseEntity<ApiResponse<FileUploadResponse>> {
+        // Different predefined type
+        val validated = fileValidationService.validateFile(file, FileType.DOCUMENT)
+        // Process file...
+    }
+    
+    // Custom validation when needed
+    @PostMapping("/custom-upload")
+    fun uploadCustom(
+        @PathVariable tenantCode: String,
+        @RequestParam("file") file: MultipartFile
+    ): ResponseEntity<ApiResponse<FileUploadResponse>> {
+        // Custom validation rules
+        val validated = fileValidationService.validateFile(
+            file = file,
+            maxSize = 100 * 1024 * 1024, // 100MB
+            allowedExtensions = setOf("zip", "rar"),
+            allowedMimeTypes = setOf("application/zip", "application/x-rar-compressed")
+        )
+        // Process file...
+    }
+}
+```
+
+**File Upload Rules:**
+1. ✅ **ALWAYS** use `FileValidationService` - don't repeat validation logic in controllers
+2. ✅ **ALWAYS** use predefined `FileType` enum for common cases (profile pictures, documents, etc.)
+3. ✅ **ALWAYS** validate file size (max size limit) - different per endpoint
+4. ✅ **ALWAYS** validate file extension (whitelist approach)
+5. ✅ **ALWAYS** validate MIME type (content-type header)
+6. ✅ **ALWAYS** validate file content (magic bytes / file signature) - prevents fake extensions
+7. ✅ **ALWAYS** sanitize filename (remove path separators, dangerous chars)
+8. ✅ **ALWAYS** store files outside web root or use secure file serving
+9. ❌ **NEVER** trust file extension alone
+10. ❌ **NEVER** use user-provided filename directly
+11. ❌ **NEVER** repeat validation logic in multiple controller methods
+
+### Request Size Limits
+
+**Configuration (application.yml):**
+```yaml
+spring:
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+  http:
+    encoding:
+      force: true
+      charset: UTF-8
+server:
+  max-http-header-size: 8KB
+```
+
+**Rules:**
+- ✅ Set reasonable limits for file uploads (e.g., 10MB for images, 50MB for documents)
+- ✅ Set max request size to prevent DoS attacks
+- ✅ Document limits in API documentation
+- ✅ Return clear error messages when limits are exceeded
+
+### Validation Error Messages
+
+**Best Practices:**
+```kotlin
+// ✅ Good - Clear, user-friendly message
+@field:NotBlank(message = "Email address is required")
+@field:Email(message = "Please enter a valid email address")
+
+// ❌ Bad - Technical, unclear
+@field:NotBlank(message = "email cannot be null")
+@field:Email(message = "invalid email format")
+
+// ✅ Good - Contextual message
+@field:Size(min = 8, max = 100, message = "Password must be between 8 and 100 characters")
+@field:Pattern(regexp = "...", message = "Password must contain at least one uppercase letter, one lowercase letter, and one number")
+```
+
+**Rules:**
+1. ✅ **ALWAYS** write user-friendly error messages
+2. ✅ **ALWAYS** explain what's wrong and how to fix it
+3. ✅ **ALWAYS** avoid technical jargon
+4. ✅ **ALWAYS** be specific (e.g., "must be between 8 and 100 characters" not "invalid length")
+
+### When to Use Custom Validators vs Built-in Annotations
+
+**Use Built-in Annotations When:**
+- ✅ Standard validation (required, size, format, range)
+- ✅ Single-field validation
+- ✅ Common patterns (email, URL, past/future dates)
+
+**Use Custom Validators When:**
+- ✅ Complex business rules
+- ✅ Cross-field validation
+- ✅ Tenant-specific rules
+- ✅ External service validation (e.g., check if email domain exists)
+- ✅ Custom format validation
+
+### Security Checklist
+
+**Before accepting any user input:**
+- [ ] Is the input validated with `@Valid` annotation?
+- [ ] Are validation annotations appropriate for the data type?
+- [ ] Are file uploads validated (size, type, content)?
+- [ ] Is user input sanitized before storage/display?
+- [ ] Are SQL queries parameterized?
+- [ ] Are file paths normalized and validated?
+- [ ] Are error messages user-friendly and non-revealing?
+- [ ] Are request size limits configured?
+
+---
+
+## Exception Handling Rules
+
+### Custom Exceptions
+1. **Use existing exception types:**
+   - `ResourceNotFoundException` - for 404 errors
+   - `TenantNotFoundException` - for tenant-related errors
+   - Create new exceptions only when needed
+
+2. **Extend RuntimeException**
+3. **GlobalExceptionHandler will catch and convert to proper HTTP responses**
+
+### GlobalExceptionHandler Implementation (CRITICAL)
+
+**Location:** `common/exception/GlobalExceptionHandler.kt`
+
+**Purpose:** Centralized exception handling for all REST controllers. Ensures consistent error responses across the entire API.
+
+**Implementation Pattern:**
+```kotlin
+@RestControllerAdvice
+class GlobalExceptionHandler(
+    private val log: Logger = LoggerFactory.getLogger(GlobalExceptionHandler::class.java)
+) {
+    
+    // Custom Business Exceptions
+    
+    @ExceptionHandler(ResourceNotFoundException::class)
+    fun handleResourceNotFound(ex: ResourceNotFoundException): ResponseEntity<ApiResponse<Unit>> {
+        log.error(ex) { "Resource not found: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(ApiResponse.failure(ex.message ?: "Resource not found"))
+    }
+    
+    @ExceptionHandler(TenantNotFoundException::class)
+    fun handleTenantNotFound(ex: TenantNotFoundException): ResponseEntity<ApiResponse<Unit>> {
+        log.error(ex) { "Tenant not found: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(ApiResponse.failure(ex.message ?: "Tenant not found"))
+    }
+    
+    // Standard Java Exceptions
+    
+    @ExceptionHandler(IllegalArgumentException::class)
+    fun handleIllegalArgument(ex: IllegalArgumentException): ResponseEntity<ApiResponse<Unit>> {
+        log.error(ex) { "Illegal argument: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(ApiResponse.failure(ex.message ?: "Invalid argument"))
+    }
+    
+    @ExceptionHandler(IllegalStateException::class)
+    fun handleIllegalState(ex: IllegalStateException): ResponseEntity<ApiResponse<Unit>> {
+        log.warn(ex) { "Illegal state: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(ApiResponse.failure(ex.message ?: "Invalid state"))
+    }
+    
+    // Security Exceptions
+    
+    @ExceptionHandler(AccessDeniedException::class)
+    fun handleAccessDenied(ex: AccessDeniedException): ResponseEntity<ApiResponse<Unit>> {
+        log.error(ex) { "Access denied: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+            .body(ApiResponse.failure("Access denied"))
+    }
+    
+    // Validation Exceptions
+    
+    @ExceptionHandler(MethodArgumentNotValidException::class)
+    fun handleValidationErrors(ex: MethodArgumentNotValidException): ResponseEntity<ApiResponse<Map<String, String>>> {
+        val errors = ex.bindingResult.fieldErrors.associate { 
+            it.field to (it.defaultMessage ?: "Invalid value")
+        }
+        log.warn { "Validation failed: $errors" }
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(ApiResponse.failure("Validation failed", errors))
+    }
+    
+    // Client Disconnect (Not an Error)
+    
+    /**
+     * Handles client abort exceptions (broken pipe) gracefully.
+     * This occurs when the client disconnects before the response is fully sent.
+     * Common with large file downloads - not a server error.
+     * ClientAbortException extends IOException, so this catches all client disconnect scenarios.
+     */
+    @ExceptionHandler(ClientAbortException::class)
+    fun handleClientAbort(ex: ClientAbortException): ResponseEntity<Unit>? {
+        // Log at debug level - this is not an error, just client disconnecting
+        log.debug(ex) { "Client disconnected before response completed: ${ex.message}" }
+        // Return null to let Spring handle it (no response body needed)
+        return null
+    }
+    
+    // Generic Exception Handler (Last Resort)
+    
+    @ExceptionHandler(Exception::class)
+    fun handleGenericException(ex: Exception): ResponseEntity<ApiResponse<Unit>> {
+        log.error(ex) { "Unexpected error: ${ex.message}" }
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+            .body(ApiResponse.failure("An unexpected error occurred"))
+    }
+}
+```
+
+**Exception-to-HTTP Status Mapping:**
+
+| Exception Type | HTTP Status | Log Level | When to Use |
+|---------------|-------------|-----------|-------------|
+| `ResourceNotFoundException` | 404 NOT_FOUND | ERROR | Entity not found in database |
+| `TenantNotFoundException` | 404 NOT_FOUND | ERROR | Tenant doesn't exist or inactive |
+| `IllegalArgumentException` | 400 BAD_REQUEST | ERROR | Invalid method/constructor argument |
+| `IllegalStateException` | 400 BAD_REQUEST | WARN | Invalid state for operation |
+| `MethodArgumentNotValidException` | 400 BAD_REQUEST | WARN | Request body validation failed |
+| `AccessDeniedException` | 403 FORBIDDEN | ERROR | User lacks required authority |
+| `ClientAbortException` | N/A (null) | DEBUG | Client disconnected (not an error) |
+| `Exception` (generic) | 500 INTERNAL_SERVER_ERROR | ERROR | Unexpected/unhandled exception |
+
+**Rules for Exception Handlers:**
+
+1. **ALWAYS use structured logging:**
+   ```kotlin
+   // ✅ Good - includes exception and message
+   log.error(ex) { "Resource not found: ${ex.message}" }
+   
+   // ❌ Bad - missing exception context
+   log.error { "Resource not found: ${ex.message}" }
+   ```
+
+2. **ALWAYS provide fallback messages:**
+   ```kotlin
+   // ✅ Good - fallback if message is null
+   .body(ApiResponse.failure(ex.message ?: "Resource not found"))
+   
+   // ❌ Bad - may return null message
+   .body(ApiResponse.failure(ex.message))
+   ```
+
+3. **ALWAYS use appropriate HTTP status codes:**
+   - 400 BAD_REQUEST: Client error (validation, invalid input)
+   - 403 FORBIDDEN: Authorization failure (user authenticated but lacks permission)
+   - 404 NOT_FOUND: Resource doesn't exist
+   - 500 INTERNAL_SERVER_ERROR: Server error (unexpected exceptions)
+
+4. **ALWAYS wrap error responses in `ApiResponse<T>`:**
+   ```kotlin
+   // ✅ Good - consistent response structure
+   return ResponseEntity.status(HttpStatus.NOT_FOUND)
+       .body(ApiResponse.failure(ex.message ?: "Resource not found"))
+   
+   // ❌ Bad - inconsistent response structure
+   return ResponseEntity.status(HttpStatus.NOT_FOUND)
+       .body(mapOf("error" to ex.message))
+   ```
+
+5. **Validation errors return field-level details:**
+   ```kotlin
+   // Validation errors include field names and messages
+   val errors = ex.bindingResult.fieldErrors.associate { 
+       it.field to (it.defaultMessage ?: "Invalid value")
+   }
+   return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+       .body(ApiResponse.failure("Validation failed", errors))
+   ```
+
+6. **Client disconnect handling:**
+   - `ClientAbortException` is NOT an error - client just disconnected
+   - Log at DEBUG level (not ERROR)
+   - Return `null` to let Spring handle gracefully
+   - Common with large file downloads
+
+7. **Generic exception handler:**
+   - MUST be last (most generic `@ExceptionHandler`)
+   - Catches all unhandled exceptions
+   - Returns generic message (don't expose internal details)
+   - Logs full exception stack trace for debugging
+
+**Adding New Exception Types:**
+
+1. **Create exception class:**
+   ```kotlin
+   class BusinessRuleViolationException(message: String) : RuntimeException(message)
+   ```
+
+2. **Add handler method:**
+   ```kotlin
+   @ExceptionHandler(BusinessRuleViolationException::class)
+   fun handleBusinessRuleViolation(ex: BusinessRuleViolationException): ResponseEntity<ApiResponse<Unit>> {
+       log.warn(ex) { "Business rule violated: ${ex.message}" }
+       return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+           .body(ApiResponse.failure(ex.message ?: "Business rule violation"))
+   }
+   ```
+
+3. **Update exception mapping table above**
+
+**Testing Exception Handlers:**
+
+```kotlin
+@SpringBootTest
+@AutoConfigureMockMvc
+class GlobalExceptionHandlerTest {
+    
+    @Autowired
+    private lateinit var mockMvc: MockMvc
+    
+    @Test
+    fun `should return 404 when resource not found`() {
+        mockMvc.perform(get("/api/admin/test/resources/unknown-id"))
+            .andExpect(status().isNotFound)
+            .andExpect(jsonPath("$.success").value(false))
+            .andExpect(jsonPath("$.message").exists())
+    }
+    
+    @Test
+    fun `should return 400 with field errors when validation fails`() {
+        val invalidRequest = mapOf("name" to "") // Empty name violates @NotBlank
+        
+        mockMvc.perform(
+            post("/api/admin/test/resources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(invalidRequest))
+        )
+            .andExpect(status().isBadRequest)
+            .andExpect(jsonPath("$.success").value(false))
+            .andExpect(jsonPath("$.data.name").exists()) // Field-level error
+    }
+}
+```
+
+---
+
+## Configuration & Environment Rules
+
+### Environment-Specific Configs
+1. **Use application-{profile}.yml for environment-specific settings**
+2. **NEVER hardcode environment-specific values**
+3. **Use `@Value("\${app.config}")` or `@ConfigurationProperties`**
+
+### Environment Keys (CRITICAL)
+- Local: `dev` (NOT 'development')
+- Staging: `ci` (NOT 'CI' or 'staging')  
+- Production: `prod` (NOT 'production')
+
+---
+
+## Terminal & Command Execution Rules
+
+### JAVA_HOME Configuration (CRITICAL)
+**ALWAYS set JAVA_HOME before running Maven commands!**
+
+1. **Before ANY Maven command (`mvn`), ALWAYS set JAVA_HOME:**
+   ```bash
+   export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+   mvn clean install
+   ```
+
+2. **Common Maven commands that require JAVA_HOME:**
+   - `mvn clean install`
+   - `mvn test`
+   - `mvn verify`
+   - `mvn spring-boot:run`
+   - `mvn jacoco:report`
+
+3. **Why this is critical:**
+   - Project uses Java 21
+   - Maven needs correct Java version to compile and run
+   - Without JAVA_HOME, Maven may use wrong Java version or fail
+
+4. **One-liner pattern (preferred):**
+   ```bash
+   export JAVA_HOME=$(/usr/libexec/java_home -v 21) && mvn test
+   ```
+
+5. **For development startup:**
+   ```bash
+   export JAVA_HOME=$(/usr/libexec/java_home -v 21) && mvn spring-boot:run
+   ```
+
+---
+
+## Development Workflow
+
+### For EVERY New Feature Implementation:
+
+1. **Design Phase:**
+   - [ ] Identify if it's platform (public schema) or tenant-specific (tenant schema)
+   - [ ] Identify if it's admin, funnel, or user endpoint
+   - [ ] Design Request/Response DTOs
+   - [ ] Plan service methods needed
+
+2. **Implementation Phase:**
+   - [ ] Create/update Entity in correct package:
+     - Platform entities: `platform/model/entity/` with `@Table(schema="public")`
+     - Tenant entities: `tenant/someTenant/model/entity/` with NO schema specified
+   - [ ] Create Request/Response DTOs in `tenant/someTenant/model/dto/`
+   - [ ] Create/update Repository in correct package (platform or tenant)
+     - MUST extend both JpaRepository AND JpaSpecificationExecutor
+   - [ ] Create Specification class extending BaseSpecification for search
+   - [ ] Implement Service in correct package with @Transactional, logging, exception handling
+     - Add search(String searchTerm, Pageable pageable) method
+   - [ ] Implement Controller in `tenant/someTenant/controller/` with full Swagger documentation
+     - Use PaginationAndSearchHelper for pagination/search
+   - [ ] Add @PreAuthorize on admin/funnel endpoints
+
+3. **Documentation Phase:**
+   - [ ] EVERY endpoint has @Operation(summary = "...")
+   - [ ] Controller has @Tag with descriptive name
+   - [ ] Admin and Funnel controllers have @SecurityRequirement
+
+4. **Testing Phase (MANDATORY):**
+   - [ ] Write unit tests for service methods (using MockK)
+   - [ ] Write integration tests for complex flows
+   - [ ] Run: `mvn test`
+   - [ ] Run: `mvn verify`
+   - [ ] Verify coverage: `mvn jacoco:report`
+   - [ ] **ALL TESTS MUST PASS**
+
+5. **Verification Phase:**
+   - [ ] Check Swagger UI: `http://localhost:PORT/swagger-ui.html`
+   - [ ] Test endpoints manually or via Swagger
+   - [ ] Verify proper error responses
+   - [ ] Check logs for proper logging
+
+### Quality Gates (MUST PASS)
+- ✅ All tests pass (`mvn test`)
+- ✅ 80% minimum code coverage
+- ✅ No compilation errors
+- ✅ Swagger documentation complete
+- ✅ Proper exception handling in place
+- ✅ Logging added for key operations
+
+---
+
+## Code Quality Standards
+
+### Kotlin-Specific Guidelines
+- **NO Lombok.** Kotlin's data classes, default args, and `@JvmOverloads` cover most cases.
+- Use `@JvmField` / `@JvmStatic` only for Java interop when strictly needed.
+- Use `object` singletons for utilities (`TenantContext`, `PathTenantExtractor`).
+- Avoid `!!`. Use safe calls and `?:` where appropriate.
+- Prefer `val` over `var` (immutability)
+- Use `data class` for DTOs and value objects
+- Use `sealed class` for type-safe state/enum alternatives when appropriate
+
+### Code Comments
+- Add KDoc for public classes explaining purpose
+- Add KDoc for service classes mentioning tenant context
+- Comment complex business logic
+- ALL comments in English
+
+### Error Messages
+- Be specific and helpful
+- Include relevant identifiers (e.g., "Resource not found with id: 123")
+- User-friendly messages in API responses
+- Technical details in logs
+
+### Code Reusability (CRITICAL)
+1. **Use utility classes to avoid duplication:**
+   - `PaginationAndSearchHelper` (common/util/) - For all pagination/search logic
+   - `BaseSpecification` (specification/) - For JPA Specification utilities
+
+2. **NEVER duplicate pagination logic in controllers**
+   - ❌ Don't manually parse sort parameters
+   - ✅ Use `PaginationAndSearchHelper.createPageable()`
+
+3. **NEVER duplicate search logic in specifications**
+   - ❌ Don't repeat LIKE pattern creation
+   - ✅ Extend `BaseSpecification` and use helper methods
+
+### Kotlin Pattern: Sealed Classes for Workflows & State Machines (CRITICAL)
+
+**Purpose:** Encode business workflows (multi-step processes) in a type-safe way, enforce valid transitions, and attach state-specific data (timestamps, actor emails, notes). This is essential for funnel admin workflows where each step has an owner and metadata.
+
+#### When to Use
+- ✅ Steps have different data requirements (e.g., `submittedAt`, `approvedBy`)
+- ✅ You must enforce step order (cannot skip review)
+- ✅ Funnel admins or system actions transition between well-defined states
+- ✅ You need exhaustive handling in `when` expressions (compiler safety)
+- ❌ Use simple enums when states are stateless or do not require extra data
+
+#### Funnel Workflow Example
+```kotlin
+sealed class FunnelWorkflowState {
+    data class LeadCaptured(val capturedAt: Instant, val capturedBy: String) : FunnelWorkflowState()
+    data class DocumentsUploaded(val uploadedAt: Instant, val uploadedBy: String) : FunnelWorkflowState()
+    data class AdminReview(val reviewedAt: Instant, val reviewedBy: String, val notes: String) : FunnelWorkflowState()
+    data class Approved(val approvedAt: Instant, val approvedBy: String) : FunnelWorkflowState()
+    data class Rejected(val rejectedAt: Instant, val rejectedBy: String, val reason: String) : FunnelWorkflowState()
+}
+
+class FunnelWorkflow : BaseEntity() {
+    var state: FunnelWorkflowState = FunnelWorkflowState.LeadCaptured(Instant.now(), "system")
+
+    fun uploadDocuments(adminEmail: String) {
+        state = when (state) {
+            is FunnelWorkflowState.LeadCaptured -> FunnelWorkflowState.DocumentsUploaded(Instant.now(), adminEmail)
+            else -> throw IllegalStateException("Documents can only be uploaded after lead capture")
+        }
+    }
+
+    fun moveToReview(adminEmail: String, notes: String) {
+        state = when (state) {
+            is FunnelWorkflowState.DocumentsUploaded -> FunnelWorkflowState.AdminReview(Instant.now(), adminEmail, notes)
+            else -> throw IllegalStateException("Review allowed only after document upload")
+        }
+    }
+}
+```
+
+#### Transition Validation Patterns
+```kotlin
+fun FunnelWorkflow.canBeApproved() = state is FunnelWorkflowState.AdminReview
+
+fun FunnelWorkflow.approve(adminEmail: String) {
+    state = when (state) {
+        is FunnelWorkflowState.AdminReview -> FunnelWorkflowState.Approved(Instant.now(), adminEmail)
+        else -> throw IllegalStateException("Workflow must be in review before approval")
+    }
+}
+
+fun FunnelWorkflow.reject(adminEmail: String, reason: String) {
+    state = when (state) {
+        is FunnelWorkflowState.AdminReview,
+        is FunnelWorkflowState.DocumentsUploaded -> FunnelWorkflowState.Rejected(Instant.now(), adminEmail, reason)
+        else -> throw IllegalStateException("Cannot reject from current state")
+    }
+}
+```
+
+#### Persistence Strategy (No Nullable Column Explosion!)
+
+1. **Primary approach (recommended): Enum + Events Table**
+   - `workflow.state` column stores simple enum (`LEAD_CAPTURED`, `ADMIN_REVIEW`, etc.)
+   - `workflow_events` table stores state-specific data (timestamps, admin emails, notes) as JSONB
+   - Benefits: no sparse columns, full audit trail, easy to query
+
+```sql
+-- workflows table
+CREATE TABLE funnel_workflows (
+    id UUID PRIMARY KEY,
+    tenant_id VARCHAR(50) NOT NULL,
+    state VARCHAR(50) NOT NULL,  -- simple enum
+    inserted_at TIMESTAMP NOT NULL
+);
+
+-- workflow events table
+CREATE TABLE funnel_workflow_events (
+    id UUID PRIMARY KEY,
+    workflow_id UUID NOT NULL REFERENCES funnel_workflows(id),
+    event_type VARCHAR(50) NOT NULL,         -- matches enum
+    event_data JSONB,                        -- {"reviewedBy":"admin@...", "notes":"..."}
+    occurred_at TIMESTAMP NOT NULL
+);
+```
+
+2. **Alternative:** JSONB column on main table (PostgreSQL only) storing the sealed class payload.
+3. **Do NOT** create many nullable columns for each state-specific field. It complicates queries and wastes space.
+
+#### Example: Mapping Enum + Events to Sealed Class
+```kotlin
+enum class FunnelWorkflowStateEnum {
+    LEAD_CAPTURED, DOCUMENTS_UPLOADED, ADMIN_REVIEW, APPROVED, REJECTED
+}
+
+@Entity
+class FunnelWorkflowEntity(
+    @Enumerated(EnumType.STRING)
+    var state: FunnelWorkflowStateEnum = FunnelWorkflowStateEnum.LEAD_CAPTURED,
+    @OneToMany(mappedBy = "workflow", cascade = [CascadeType.ALL])
+    var events: MutableList<FunnelWorkflowEventEntity> = mutableListOf()
+) : BaseEntity() {
+
+    fun toDomainState(): FunnelWorkflowState {
+        val latestEvent = events.maxByOrNull { it.occurredAt }
+        return when (state) {
+            FunnelWorkflowStateEnum.LEAD_CAPTURED ->
+                FunnelWorkflowState.LeadCaptured(insertTime ?: Instant.now(), "system")
+            FunnelWorkflowStateEnum.ADMIN_REVIEW -> {
+                val data = latestEvent?.eventData ?: error("Missing review event data")
+                FunnelWorkflowState.AdminReview(latestEvent.occurredAt, data.reviewedBy, data.notes)
+            }
+            // ... handle other states
+        }
+    }
+}
+```
+
+#### Rules
+- ✅ Use sealed classes for workflow/state-machine logic in Kotlin code (domain layer)
+- ✅ Persist state via simple enums + event/audit tables to avoid nullable columns
+- ✅ Add helper methods (`canMoveToNextStep()`, `transitionToX()`) to enforce order
+- ✅ Include actor emails and timestamps in state data (auditability)
+- ✅ Cover all states in `when` expressions (compiler enforces exhaustiveness)
+- ❌ Do NOT store sealed class instances directly in entity fields (JPA unaware)
+- ❌ Do NOT create one nullable column per possible state attribute
+
+#### Funnel Admin Responsibilities
+- Each workflow transition method should validate that the acting admin has the correct role (`FUNNEL_ADMIN` or assigned owner).
+- Log every transition (`log.info { "Workflow ${workflow.id} moved to AdminReview by $adminEmail" }`).
+- Add integration tests covering valid and invalid transitions.
+
+---
+
+## Database & Liquibase Rules
+
+### Migrations
+1. **ALWAYS use Liquibase for schema changes**
+2. **Create migrations in `db/changelog/migrations/`**
+3. **Migration Modification Policy:**
+   - **During Development (Before CI Deployment)**: You CAN modify existing migrations if needed (e.g., fixing typos, adjusting schema, correcting mistakes)
+   - **After CI Deployment**: **NEVER modify existing migrations** - they are immutable. Create a new migration file instead.
+   - **Why**: Once migrations run in CI/prod, changing them can cause inconsistencies and deployment failures. Always create new migrations for changes after CI deployment.
+4. **Use sequential numbering: 003-description.xml**
+5. **ALWAYS specify schemaName explicitly:**
+   - Public schema tables: `schemaName="public"`
+   - Tenant schema tables: `schemaName="someTenant"` (or tenant name)
+   - Example: `<createTable tableName="resources" schemaName="someTenant">`
+6. **CRITICAL: ALWAYS add new migration files to `db.changelog-master.xml`:**
+   - After creating a new migration file (e.g., `004-description.xml`), **MUST** add it to `db/changelog/db.changelog-master.xml`
+   - Add `<include file="db/changelog/migrations/004-description.xml"/>` in the correct order
+   - Migrations will NOT run if not included in master changelog
+   - Check existing migrations in master changelog to determine correct order
+
+### Seed Data
+1. **Seeds only in dev/ci profiles**
+2. **Create in `db/changelog/seeds/`**
+3. **Include test tenant for localhost domain**
+4. **CRITICAL: ALWAYS add new seed files to `db.changelog-master.xml`:**
+   - After creating a new seed file (e.g., `003-seed-description.xml`), **MUST** add it to `db/changelog/db.changelog-master.xml`
+   - Add `<include file="db/changelog/seeds/003-seed-description.xml" context="seed"/>` in the correct order
+   - Seed files will NOT run if not included in master changelog
+   - Use `context="seed"` attribute for seed files (they only run in dev/ci profiles)
+
+### Database Indexing Strategy (CRITICAL - Performance)
+
+**Purpose:** Indexes dramatically improve query performance by allowing the database to quickly locate rows without scanning entire tables.
+
+**CRITICAL: Index Management with Liquibase**
+
+**When using Liquibase (which this project does), ALWAYS manage indexes in Liquibase migrations, NOT in entity annotations.**
+
+**Why:**
+- ✅ Better version control and review process
+- ✅ Explicit control over when indexes are created
+- ✅ Easier to add indexes to existing tables
+- ✅ Can be reviewed in migration files before deployment
+- ✅ Consistent with database-first approach
+
+**Entity annotations should NOT include indexes:**
+```kotlin
+// ❌ Bad - Don't define indexes in entity when using Liquibase
+@Entity
+@Table(
+    name = "resources",
+    indexes = [
+        Index(name = "fk_resource_city", columnList = "city_id")
+    ]
+)
+class Resource : BaseEntity() {
+    // ...
+}
+
+// ✅ Good - Clean entity, indexes managed in Liquibase
+@Entity
+@Table(name = "resources")
+class Resource : BaseEntity() {
+    @ManyToOne
+    @JoinColumn(name = "city_id")
+    val city: City? = null
+}
+```
+
+**When to Create Indexes (Managed in Liquibase):**
+
+1. **Foreign Key Columns (ALWAYS):**
+   ```xml
+   <!-- db/changelog/migrations/010-create-resources-table.xml -->
+   <changeSet id="010-create-resources-table" author="developer">
+       <createTable tableName="resources" schemaName="someTenant">
+           <column name="id" type="UUID">
+               <constraints primaryKey="true"/>
+           </column>
+           <column name="city_id" type="UUID"/>
+           <!-- ... other columns ... -->
+       </createTable>
+       
+       <!-- Add foreign key constraint (PostgreSQL automatically creates index) -->
+       <addForeignKeyConstraint
+           constraintName="fk_resource_city"
+           baseTableName="resources"
+           baseColumnNames="city_id"
+           referencedTableName="cities"
+           referencedColumnNames="id"
+           baseTableSchemaName="someTenant"
+           referencedTableSchemaName="someTenant"/>
+   </changeSet>
+   ```
+   **Why:** 
+   - Foreign keys are frequently used in JOINs and WHERE clauses
+   - PostgreSQL automatically creates an index when you add a foreign key constraint
+   - No need to manually create index - `addForeignKeyConstraint` handles it
+
+2. **Columns Used in WHERE Clauses Frequently:**
+   ```xml
+   <createIndex indexName="idx_resource_status" tableName="resources" schemaName="someTenant">
+       <column name="status"/>
+   </createIndex>
+   ```
+   **Why:** Speeds up filtering operations.
+
+3. **Columns Used in ORDER BY Frequently:**
+   ```xml
+   <createIndex indexName="idx_resource_created" tableName="resources" schemaName="someTenant">
+       <column name="insert_time"/>
+   </createIndex>
+   ```
+   **Why:** Speeds up sorting operations.
+
+4. **Unique Constraints (Automatic Index):**
+   ```xml
+   <addUniqueConstraint 
+       constraintName="uk_resource_email" 
+       tableName="resources" 
+       schemaName="someTenant"
+       columnNames="email"/>
+   ```
+   **Note:** Unique constraints automatically create indexes in PostgreSQL.
+
+5. **Search Fields (For Full-Text or LIKE Queries):**
+   ```xml
+   <createIndex indexName="idx_resource_name_search" tableName="resources" schemaName="someTenant">
+       <column name="name"/>
+   </createIndex>
+   ```
+
+**Index Naming Conventions:**
+
+**Patterns:**
+- Foreign key constraints: `fk_{table_name}_{referenced_table_name}` (index created automatically)
+- Regular indexes: `idx_{table_name}_{column_name(s)}`
+- Unique constraints: `uk_{table_name}_{column_name(s)}`
+
+**Examples:**
+- `fk_resource_city` - Foreign key constraint on `resources.city_id` (references `cities.id`, index created automatically)
+- `fk_resource_user` - Foreign key constraint on `resources.user_id` (references `users.id`, index created automatically)
+- `idx_resource_status` - Regular index on `resources.status`
+- `idx_resource_status_created` - Composite index on `resources.status, insert_time`
+- `idx_user_email` - Regular index on `users.email`
+- `uk_resource_email` - Unique constraint (starts with `uk_` not `idx_`)
+
+**Rules:**
+- ✅ Use `fk_` prefix for foreign key constraint names (index is created automatically by PostgreSQL)
+- ✅ Use `idx_` prefix for regular indexes
+- ✅ Use `uk_` prefix for unique constraints
+- ✅ Include table name for clarity
+- ✅ Include column name(s) for composite indexes
+- ✅ Use lowercase with underscores
+- ✅ Keep names descriptive but concise (max 63 chars in PostgreSQL)
+- ✅ **NEVER manually create index for foreign keys** - use `addForeignKeyConstraint` instead
+
+**Composite Index Guidelines:**
+
+**When to Use Composite Indexes:**
+```xml
+<!-- Composite index for queries filtering by both columns -->
+<createIndex 
+    indexName="idx_resource_status_created" 
+    tableName="resources" 
+    schemaName="someTenant">
+    <column name="status"/>
+    <column name="insert_time"/>
+</createIndex>
+```
+
+**Use Cases:**
+- ✅ Queries filtering by multiple columns: `WHERE status = ? AND insert_time > ?`
+- ✅ Queries with ORDER BY on multiple columns: `ORDER BY status, insert_time`
+- ✅ Covering index (includes all columns needed for query)
+
+**Column Order Matters:**
+```xml
+<!-- ✅ Good - Most selective column first -->
+<createIndex 
+    indexName="idx_resource_status_created" 
+    tableName="resources" 
+    schemaName="someTenant">
+    <column name="status"/>      <!-- More selective (fewer values) -->
+    <column name="insert_time"/> <!-- Less selective (many values) -->
+</createIndex>
+<!-- Query: WHERE status = 'ACTIVE' AND insert_time > ? -->
+<!-- Status is more selective (fewer values) than insert_time -->
+
+<!-- ❌ Bad - Less selective column first -->
+<createIndex 
+    indexName="idx_resource_created_status" 
+    tableName="resources" 
+    schemaName="someTenant">
+    <column name="insert_time"/> <!-- Less selective -->
+    <column name="status"/>      <!-- More selective -->
+</createIndex>
+<!-- Less efficient - database can't use index as effectively -->
+```
+
+**Rules:**
+- ✅ Put most selective column first (fewer distinct values)
+- ✅ Put columns used in WHERE before columns used in ORDER BY
+- ✅ Limit to 2-3 columns (more columns = larger index = slower writes)
+
+**Migration Pattern for Index Creation:**
+
+**CRITICAL: Always use Liquibase migrations for indexes (this project uses Liquibase).**
+
+**Pattern 1: Indexes in Same Migration as Table Creation (Recommended):**
+```xml
+<!-- db/changelog/migrations/010-create-resources-table.xml -->
+<changeSet id="010-create-resources-table" author="developer">
+    <!-- Create table -->
+    <createTable tableName="resources" schemaName="someTenant">
+        <column name="id" type="UUID">
+            <constraints primaryKey="true"/>
+        </column>
+        <column name="city_id" type="UUID"/>
+        <column name="status" type="VARCHAR(50)"/>
+        <column name="name" type="VARCHAR(255)"/>
+        <column name="insert_time" type="TIMESTAMP"/>
+        <!-- ... other columns ... -->
+    </createTable>
+    
+    <!-- Add foreign key constraint (index created automatically) -->
+    <addForeignKeyConstraint
+        constraintName="fk_resource_city"
+        baseTableName="resources"
+        baseColumnNames="city_id"
+        referencedTableName="cities"
+        referencedColumnNames="id"
+        baseTableSchemaName="someTenant"
+        referencedTableSchemaName="someTenant"/>
+    
+    <!-- Create regular indexes -->
+    <createIndex indexName="idx_resource_status" tableName="resources" schemaName="someTenant">
+        <column name="status"/>
+    </createIndex>
+    
+    <createIndex indexName="idx_resource_created" tableName="resources" schemaName="someTenant">
+        <column name="insert_time"/>
+    </createIndex>
+</changeSet>
+```
+
+**Pattern 2: Separate Migration for Indexes (For Existing Tables):**
+```xml
+<!-- db/changelog/migrations/015-add-resource-indexes.xml -->
+<changeSet id="015-add-resource-indexes" author="developer">
+    <!-- Add foreign key constraint if not already added (index created automatically) -->
+    <addForeignKeyConstraint
+        constraintName="fk_resource_city"
+        baseTableName="resources"
+        baseColumnNames="city_id"
+        referencedTableName="cities"
+        referencedColumnNames="id"
+        baseTableSchemaName="someTenant"
+        referencedTableSchemaName="someTenant"/>
+    
+    <!-- Create regular indexes -->
+    <createIndex 
+        indexName="idx_resource_status_created" 
+        tableName="resources" 
+        schemaName="someTenant">
+        <column name="status"/>
+        <column name="insert_time"/>
+    </createIndex>
+</changeSet>
+```
+
+**When to Use Each:**
+- ✅ **Same migration as table**: New tables, indexes defined upfront (recommended)
+- ✅ **Separate migration**: Adding indexes to existing tables, performance optimization after deployment
+
+**Composite Index Example:**
+```xml
+<createIndex 
+    indexName="idx_resource_status_created" 
+    tableName="resources" 
+    schemaName="someTenant">
+    <column name="status"/>
+    <column name="insert_time"/>
+</createIndex>
+```
+
+**Important Notes:**
+- ❌ **NEVER** define indexes in entity `@Table` annotations when using Liquibase
+- ✅ **ALWAYS** use `addForeignKeyConstraint` for foreign keys (index created automatically by PostgreSQL)
+- ✅ **ALWAYS** define regular indexes in Liquibase migrations for version control and explicit management
+- ✅ Entity classes should be clean - no index definitions
+- ✅ **NEVER manually create index for foreign keys** - PostgreSQL creates it automatically when you add the constraint
+
+**Index Maintenance Considerations:**
+
+1. **Index Overhead:**
+   - Indexes speed up reads but slow down writes (INSERT, UPDATE, DELETE)
+   - Each index must be updated when data changes
+   - **Rule:** Don't over-index - only index what you actually query
+
+2. **Index Size:**
+   - Indexes consume disk space
+   - Composite indexes are larger than single-column indexes
+   - Monitor index size in production
+
+3. **Index Usage Monitoring:**
+   ```sql
+   -- PostgreSQL: Check unused indexes
+   SELECT schemaname, tablename, indexname, idx_scan
+   FROM pg_stat_user_indexes
+   WHERE idx_scan = 0
+   ORDER BY pg_relation_size(indexrelid) DESC;
+   ```
+   **Action:** Consider dropping unused indexes to improve write performance.
+
+4. **Partial Indexes (PostgreSQL):**
+   ```xml
+   <!-- Index only for active resources -->
+   <sql>
+       CREATE INDEX idx_resource_active_created 
+       ON someTenant.resources (insert_time) 
+       WHERE status = 'ACTIVE';
+   </sql>
+   ```
+   **Use Case:** When you frequently query a subset of rows (e.g., only active records).
+
+5. **Index Rebuilding:**
+   - PostgreSQL: `REINDEX INDEX index_name;`
+   - Usually not needed unless index is corrupted
+   - Can be done during maintenance windows
+
+**Index Checklist:**
+
+Before creating an index, ask:
+- [ ] Is this column used in WHERE clauses frequently?
+- [ ] Is this column used in JOIN conditions?
+- [ ] Is this column used in ORDER BY frequently?
+- [ ] Is this a foreign key column?
+- [ ] Will this index be used often enough to justify write overhead?
+- [ ] Is the table large enough to benefit from indexing? (small tables don't need indexes)
+
+**Common Mistakes to Avoid:**
+
+- ❌ **Over-indexing:** Creating indexes on every column (slows down writes)
+- ❌ **Under-indexing:** Missing indexes on frequently queried columns (slow reads)
+- ❌ **Wrong column order:** In composite indexes, less selective column first
+- ❌ **Indexing low-cardinality columns:** Columns with few distinct values (e.g., boolean, enum with 2-3 values)
+- ❌ **Not adding foreign key constraints:** Foreign keys are almost always needed in JOINs, and PostgreSQL automatically creates indexes for them
+
+---
+
+## Documentation Requirements
+
+### When to Update Documentation
+After implementing features that change:
+- API endpoints → Update README.md API section
+- Configuration → Update SETUP_GUIDE.md
+- Architecture → Update PROJECT_SUMMARY.md
+
+### In-Code Documentation
+- KDoc on all public classes
+- Swagger annotations on ALL endpoints
+- Clear variable names (self-documenting code)
+- Comments for complex logic only
+
+---
+
+## Logging & Observability
+
+**See Service Layer Development Rules > Logging section for comprehensive logging guidelines.**
+
+* Use `io.github.microutils:kotlin-logging` library (wraps slf4j with idiomatic Kotlin API).
+* Import: `import mu.KotlinLogging`
+* Usage: `private val log = KotlinLogging.logger {}`
+
+---
+
+## CI/CD & Environment
+
+* Keep Maven; ensure `pom.xml` includes Kotlin plugin configuration and `kotlin-spring`, `kotlin-jpa`, `kotlin-noarg`/`all-open` where needed.
+* GitHub Actions: same pipeline as Java project but compile Kotlin code via Maven Kotlin plugin.
+* Railway manages DB instances environments other than dev. For dev create docker compose to start db.
+
+---
+
+## What Cursor must NOT do
+
+* Do NOT generate Java code by default.
+* Do NOT use Lombok in Kotlin modules.
+* Do NOT hardcode API paths anywhere — always use `BasePaths` constants.
+* Do NOT clear `TenantContext` to null during validation flows.
+* Do NOT add `hibernate.default_schema` to `application.yml`.
+* Do NOT use `!!` operator unless absolutely necessary (prefer safe calls and null handling).
+* **CRITICAL: Do NOT update `.cursorrules` file without explicit user approval.** Always ask first, explain why, and wait for approval before making any changes.
+
+---
+
+## Quick Kotlin examples (for Cursor usage templates)
+
+### TenantContext (Kotlin)
+```kotlin
+object TenantContext {
+    private val current = ThreadLocal<String?>()
+
+    fun setCurrentTenant(tenant: String) = current.set(tenant)
+    fun getCurrentTenant(): String? = current.get()
+    fun clear() = current.remove()
+}
+```
+
+### Path constant example (Kotlin)
+```kotlin
+object BasePaths {
+  const val API_ADMIN = "/api/admin"
+  const val API_FUNNEL = "/api/funnel"
+  const val API_USER = "/api/user"
+  const val TENANT_CODE = "/{tenantCode}"
+    const val FUNNEL_RESOURCE = "$API_FUNNEL$TENANT_CODE/resource"
+}
+```
+
+### ApiResponse (Kotlin)
+```kotlin
+data class ApiResponse<T>(
+  val success: Boolean = true,
+  val data: T? = null,
+  val message: String? = null
+) {
+  companion object {
+    fun <T> success(data: T?, message: String? = null) = ApiResponse(true, data, message)
+    fun <T> failure(message: String) = ApiResponse<T>(false, null, message)
+  }
+}
+```
+
+### Entity Example (Kotlin)
+```kotlin
+@Entity
+@Table(name = "resources")
+open class Resource(
+    // Inherits: id (UUID), insertTime, updateTime, insertUser, updateUser from BaseEntity
+    @Column(name = "name", nullable = false)
+    open var name: String = ""
+) : BaseEntity()
+```
+
+### Service Example (Kotlin)
+```kotlin
+@Service
+class ResourceService(
+    private val repository: ResourceRepository
+) {
+    private val log = KotlinLogging.logger {}
+    
+    /**
+     * Operations are performed in the context of the current tenant schema.
+     */
+    @Transactional(readOnly = true)
+    fun findById(resourceId: UUID): Resource {
+        log.info { "Retrieving resource with id: $resourceId" }
+        return repository.findById(resourceId)
+            .orElseThrow { ResourceNotFoundException("Resource not found with id: $resourceId") }
+    }
+    
+    @Transactional
+    fun create(request: ResourceRequest): Resource {
+        log.info { "Creating resource: ${request.name}" }
+        val resource = toEntity(request)  // See Service Layer Development Rules > DTO Conversion for conversion patterns
+        val saved = repository.save(resource)
+        log.info { "Created resource: ${saved.name} with id: ${saved.id}" }
+        return saved
+    }
+}
+```
+
+### Controller Example (Kotlin)
+```kotlin
+@RestController
+@RequestMapping(BasePaths.FUNNEL_RESOURCE)
+@Tag(name = "Funnel - Resource", description = "Resource management endpoints for funnel admins")
+@SecurityRequirement(name = "Bearer Authentication")
+class FunnelResourceController(
+    private val service: ResourceService
+) {
+    
+    @GetMapping
+    @Operation(summary = "Get all resources with pagination and search")
+    @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')")
+    fun getAll(
+        @PathVariable tenantCode: String,
+        @RequestParam(defaultValue = "0") page: Int,
+        @RequestParam(defaultValue = "20") size: Int,
+        @RequestParam(defaultValue = "insertTime,desc") sort: String,  // Uses insertTime from BaseEntity
+        @RequestParam(required = false) search: String?
+    ): ResponseEntity<ApiResponse<Page<ResourceResponse>>> {
+        val pageable = PaginationAndSearchHelper.createPageable(page, size, sort)
+        val results = PaginationAndSearchHelper.executeSearch(
+            search, pageable, service::search, service::findAll)
+        return ResponseEntity.ok(ApiResponse.success(results))
+    }
+    
+    @GetMapping("/{resourceId}")
+    @Operation(summary = "Get resource by ID")
+    @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')")
+    fun getById(
+        @PathVariable tenantCode: String,
+        @PathVariable resourceId: UUID  // ✅ Use descriptive name, UUID type
+    ): ResponseEntity<ApiResponse<ResourceResponse>> {
+        val resource = service.findById(resourceId)
+        return ResponseEntity.ok(ApiResponse.success(toResponse(resource)))
+    }
+    
+    @PostMapping
+    @Operation(summary = "Create new resource")
+    @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')")
+    fun create(
+        @PathVariable tenantCode: String,
+        @Valid @RequestBody request: ResourceRequest
+    ): ResponseEntity<ApiResponse<ResourceResponse>> {
+        val resource = service.create(request)
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(ApiResponse.success(toResponse(resource), "Resource created successfully"))
+    }
+    
+    @PutMapping("/{resourceId}")
+    @Operation(summary = "Update resource")
+    @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')")
+    fun update(
+        @PathVariable tenantCode: String,
+        @PathVariable resourceId: UUID,  // ✅ Use descriptive name, UUID type
+        @Valid @RequestBody request: ResourceRequest
+    ): ResponseEntity<ApiResponse<ResourceResponse>> {
+        val resource = service.update(resourceId, request)
+        return ResponseEntity.ok(ApiResponse.success(toResponse(resource), "Resource updated successfully"))
+    }
+    
+    @DeleteMapping("/{resourceId}")
+    @Operation(summary = "Delete resource")
+    @PreAuthorize("hasAnyAuthority('SUPER_ADMIN', 'FUNNEL_ADMIN')")
+    fun delete(
+        @PathVariable tenantCode: String,
+        @PathVariable resourceId: UUID  // ✅ Use descriptive name, UUID type
+    ): ResponseEntity<ApiResponse<Unit>> {
+        service.delete(resourceId)
+        return ResponseEntity.ok(ApiResponse.success(null, "Resource deleted successfully"))
+    }
+    
+    // DTO conversion - see Service Layer Development Rules > DTO Conversion for patterns
+    private fun toResponse(entity: Resource): ResourceResponse {
+        return ResourceResponse(
+            id = entity.id!!,
+            name = entity.name,
+            // ... map other fields
+        )
+    }
+}
+```
+
+---
+
+## Final notes for Cursor
+
+* Always ask clarifying questions only when user intent is ambiguous. If user asked "generate controller X", produce full Kotlin code with imports and package. If the user asks for architectural advice, be concise and actionable.
+* When generating code, include tests (unit + integration skeleton) by default for non-trivial endpoints.
+* Ensure generated Kotlin compiles (basic sanity) and uses `kotlin-jpa` plugin conventions for entities.
+* Use MockK for all unit tests (not Mockito).
+* Use `kotlin-logging` library for all logging (not raw LoggerFactory).
+* **CRITICAL**: Never update `.cursorrules` file without explicit user approval. Always ask first and explain why the update is needed.
+
+---
