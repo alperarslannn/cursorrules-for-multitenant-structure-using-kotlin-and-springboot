@@ -1,0 +1,1 @@
+# cursorrules-for-multitenant-structure-using-kotlin-and-springboot
